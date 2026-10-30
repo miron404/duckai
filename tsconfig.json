@@ -13,6 +13,6 @@
     "noEmit": true,
     "types": ["bun-types"],
   },
-  "include": ["src/**/*", "tests/**/*", "env.d.ts"],
+  "include": ["src/**/*", "tests/**/*", "scripts/**/*", "env.d.ts"],
   "exclude": ["node_modules", "dist"],
 }
