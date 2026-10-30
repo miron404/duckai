@@ -1,11 +1,14 @@
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import OpenAI from "openai";
 
+// Live end-to-end suite (spawns the real server). Opt in with DUCKAI_LIVE=1.
+const LIVE = process.env.DUCKAI_LIVE === "1";
 const BASE_URL = "http://localhost:3003";
 let server: any;
 let openai: OpenAI;
 
 beforeAll(async () => {
+  if (!LIVE) return;
   // Start the server for testing
   const { spawn } = require("child_process");
   server = spawn("bun", ["run", "src/server.ts"], {
@@ -29,7 +32,7 @@ afterAll(() => {
   }
 });
 
-describe("OpenAI JavaScript Library - Core Tests", () => {
+describe.skipIf(!LIVE)("OpenAI JavaScript Library - Core Tests", () => {
   describe("Models API", () => {
     it("should list models using OpenAI library", async () => {
       const models = await openai.models.list();
@@ -40,7 +43,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
 
       // Check that we have expected models
       const modelIds = models.data.map((m) => m.id);
-      expect(modelIds).toContain("gpt-4o-mini");
+      expect(modelIds).toContain("gpt-6-luna");
       expect(modelIds).toContain("claude-3-haiku-20240307");
 
       // Check model structure
@@ -62,14 +65,14 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
       );
 
       const testPromise = openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         messages: [{ role: "user", content: "Say hello" }],
       });
 
       const completion = await Promise.race([testPromise, timeoutPromise]);
 
       expect(completion.object).toBe("chat.completion");
-      expect(completion.model).toBe("gpt-4o-mini");
+      expect(completion.model).toBe("gpt-6-luna");
       expect(completion.choices).toHaveLength(1);
 
       const choice = completion.choices[0];
@@ -100,7 +103,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
 
     it("should handle system messages", async () => {
       const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         messages: [
           { role: "system", content: "You are a helpful assistant." },
           { role: "user", content: "How are you?" },
@@ -113,7 +116,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
 
     it("should handle optional parameters", async () => {
       const completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         messages: [{ role: "user", content: "Tell me a short joke" }],
         temperature: 0.7,
         max_tokens: 50,
@@ -126,7 +129,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
   describe("Streaming Chat Completions", () => {
     it("should create streaming chat completion using OpenAI library", async () => {
       const stream = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         messages: [{ role: "user", content: "Count from 1 to 3" }],
         stream: true,
       });
@@ -138,7 +141,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
         chunks.push(chunk);
 
         expect(chunk.object).toBe("chat.completion.chunk");
-        expect(chunk.model).toBe("gpt-4o-mini");
+        expect(chunk.model).toBe("gpt-6-luna");
         expect(chunk.choices).toHaveLength(1);
 
         const choice = chunk.choices[0];
@@ -173,7 +176,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
     it("should handle invalid requests properly", async () => {
       try {
         await openai.chat.completions.create({
-          model: "gpt-4o-mini",
+          model: "gpt-6-luna",
           messages: [] as any, // Invalid empty messages
         });
 
@@ -189,7 +192,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
     it("should handle malformed messages", async () => {
       try {
         await openai.chat.completions.create({
-          model: "gpt-4o-mini",
+          model: "gpt-6-luna",
           messages: [{ role: "invalid" as any, content: "test" }],
         });
 
@@ -209,7 +212,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
         [{ role: "user", content: "What is 2+2?" }];
 
       const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         messages: conversation,
       });
 
@@ -220,7 +223,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
       conversation.push({ role: "user", content: "What about 3+3?" });
 
       const response2 = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         messages: conversation,
       });
 
@@ -229,7 +232,7 @@ describe("OpenAI JavaScript Library - Core Tests", () => {
 
     it("should handle streaming like real OpenAI", async () => {
       const stream = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: "gpt-6-luna",
         messages: [{ role: "user", content: "Write a very short poem" }],
         stream: true,
       });
