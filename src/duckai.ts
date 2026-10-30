@@ -4,6 +4,7 @@ import { RateLimitStore } from "./rate-limit-store";
 import { SharedRateLimitMonitor } from "./shared-rate-limit-monitor";
 import { DUCKAI_MODELS } from "./models";
 import { config } from "./config";
+import { CookieJar } from "./cookie-jar";
 import { RateLimitError, UpstreamError, ValidationError } from "./errors";
 import type {
   ChatCompletionMessage,
@@ -136,10 +137,14 @@ export class DuckAI {
   /** Serialises the "check limits, then record the request" critical section. */
   private slotLock: Promise<void> = Promise.resolve();
 
+  /** Cookies picked up from duck.ai (plus anything seeded via `X_COOKIE`). */
+  private cookies = new CookieJar();
+
   constructor() {
     this.rateLimitStore = new RateLimitStore();
     this.rateLimitMonitor = new SharedRateLimitMonitor();
     this.loadRateLimitFromStore();
+    this.cookies.seed(config.cookie);
   }
 
   // ---------------------------------------------------------------- rate limit
@@ -350,6 +355,8 @@ export class DuckAI {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} ${response.statusText}`);
       }
+      // The landing page is where a browser picks up its first cookies.
+      this.cookies.absorb(response.headers);
 
       const html = await response.text();
       const dom = new JSDOM(html);
@@ -483,6 +490,7 @@ export class DuckAI {
 
     const response = await fetch(DUCKAI_STATUS_URL, {
       headers: {
+        ...this.cookieHeaders(),
         accept: "*/*",
         "accept-language": config.acceptLanguage,
         "cache-control": "no-store",
@@ -499,6 +507,7 @@ export class DuckAI {
       method: "GET",
       signal: AbortSignal.timeout(config.requestTimeoutMs),
     });
+    this.cookies.absorb(response.headers);
 
     if (!response.ok) {
       throw new UpstreamError(
@@ -526,6 +535,7 @@ export class DuckAI {
     timeoutMs: number = config.requestTimeoutMs,
   ): Promise<Response> {
     const headers: Record<string, string> = {
+      ...this.cookieHeaders(),
       accept: "text/event-stream",
       "accept-language": config.acceptLanguage,
       "cache-control": "no-cache",
@@ -554,6 +564,12 @@ export class DuckAI {
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(timeoutMs),
     });
+  }
+
+  /** `Cookie` header for the duck.ai requests, empty when the jar is empty. */
+  private cookieHeaders(): Record<string, string> {
+    const cookie = this.cookies.header();
+    return cookie ? { cookie } : {};
   }
 
   private retryDelay(attempt: number): number {
@@ -817,6 +833,7 @@ export class DuckAI {
     feVersion: string;
     stack: string;
     durableStream: boolean;
+    cookies: string[];
   }> {
     const frontend = await this.getFrontendInfo();
     return {
@@ -824,6 +841,7 @@ export class DuckAI {
       feVersion: this.xFeVersion(frontend),
       stack: this.stackFor(frontend),
       durableStream: config.streamKey.length > 0,
+      cookies: this.cookies.names(),
     };
   }
 

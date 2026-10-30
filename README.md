@@ -288,6 +288,7 @@ The server talks to DuckDuckGo's internal chat API. It discovers the current fro
 | `X_USER_AGENT` | Recommended | Built-in Chrome UA | `User-Agent` sent to duck.ai, used for both the VQD and the chat request |
 | `X_ACCEPT_LANGUAGE` | No | `en-US,en;q=0.9` | `Accept-Language` sent to duck.ai |
 | `STREAM_KEY` | No | – | RSA-OAEP public key (`{"publicKey":{...}}`); adds `durableStream` to every request. Only relevant for resuming interrupted streams — generate one with `bun run stream-key` |
+| `X_COOKIE` | No | – | Raw `Cookie:` header value sent to duck.ai (cookies picked up from `GET /` and `GET /status` are added to the same jar). Measured: duck.ai sets no cookies, so this is a diagnostic hook rather than a fix |
 | `X_EMIT_REASONING` | No | Off | Set to `1` or `true` to expose model reasoning as `reasoning_content` |
 | `X_MODELS_JSON` | No | Built-in list | JSON object that replaces the built-in model list |
 | `X_VQD_STACK` | No | auto-discovered | Overrides the `meta.stack` value of the VQD challenge |
@@ -302,6 +303,25 @@ The server talks to DuckDuckGo's internal chat API. It discovers the current fro
 | `X_STREAM_TIMEOUT_MS` | No | `600000` | Timeout for streaming upstream requests |
 | `X_MAX_BODY_BYTES` | No | `26214400` | Maximum accepted request body (25 MiB) |
 | `NODE_ENV` | No | – | `development` or `production` |
+
+### Cookies
+
+A browser sends a `Cookie:` header, so it is tempting to assume duck.ai wants
+one. It does not: measured against the live API, `GET /`, `GET /status` and even
+the `418` response carry **no `Set-Cookie` at all**, and there are no cookies
+scoped to `duck.ai` for a client that never received any. All session state
+travels in `x-vqd-hash-1` (and the frontend version headers), which is why the
+JSDOM-solved challenge is accepted on a cold connection.
+
+The client still keeps a cookie jar (`src/cookie-jar.ts`): it absorbs whatever
+`GET /` and `GET /status` hand out and replays it on `/status` and `/chat`, and
+`X_COOKIE` seeds it with a raw header value copied from a browser
+(`DevTools → Network → any duck.ai request → Copy as cURL`). That makes the
+"cookies are the missing state" theory testable in one request:
+
+```bash
+X_COOKIE='atb=...; ah=...' bun run probe --count=1 --dump
+```
 
 ### Capturing browser state
 

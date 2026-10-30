@@ -93,4 +93,13 @@ export const config = {
   get streamKey(): string {
     return process.env.STREAM_KEY || "";
   },
+
+  /**
+   * Raw `Cookie:` header value captured from a browser, e.g.
+   * `atb=...; ah=...` (see "Cookies" in README.md). Cookies picked up from
+   * duck.ai responses are added to the same jar.
+   */
+  get cookie(): string {
+    return process.env.X_COOKIE || "";
+  },
 };

@@ -12,6 +12,8 @@
  *   bun run scripts/duck-probe.ts --mode=chat         # full OpenAIService path
  *   bun run scripts/duck-probe.ts --jsa=<base64>      # replay a browser-captured
  *                                                     # x-vqd-hash-1 value
+ *   bun run scripts/duck-probe.ts --dump              # full error payload, with
+ *                                                     # the `cd` blob decoded
  *   STREAM_KEY='{"publicKey":{...}}' bun run scripts/duck-probe.ts
  *
  * Both modes build the upstream body through the same `validateRequest` +
@@ -36,6 +38,7 @@ interface Options {
   prompt: string;
   mode: "raw" | "chat";
   jsa?: string;
+  dump: boolean;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -44,6 +47,7 @@ function parseArgs(argv: string[]): Options {
     model: "gpt-6-luna",
     prompt: "Reply with the single word: pong",
     mode: "raw",
+    dump: false,
   };
 
   for (const arg of argv) {
@@ -68,6 +72,9 @@ function parseArgs(argv: string[]): Options {
       case "--jsa":
         options.jsa = value;
         break;
+      case "--dump":
+        options.dump = true;
+        break;
       default:
         if (arg.startsWith("--")) throw new Error(`Unknown flag: ${arg}`);
     }
@@ -86,6 +93,47 @@ function summarize(statuses: string[]): string {
     .join(" ");
 }
 
+/**
+ * Decodes the `cd` blob of a duck.ai error payload. The field carries the
+ * server's own view of the request (`overrideCode`, `o`/`q` blobs), which is
+ * the only diagnostic the API gives for a rejected challenge.
+ */
+function describeErrorPayload(body: string): string[] {
+  const lines: string[] = [];
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return [body.trim()];
+  }
+
+  lines.push(body.trim());
+  const cd = payload.cd as Record<string, unknown> | undefined;
+  if (!cd) return lines;
+
+  for (const [key, value] of Object.entries(cd)) {
+    const raw = String(value);
+    lines.push(`    cd.${key} = ${raw.slice(0, 160)}${raw.length > 160 ? "…" : ""}`);
+    if (key !== "o" && key !== "q") continue;
+    for (const decoder of [
+      (input: string) => decodeURIComponent(input),
+      (input: string) => Buffer.from(input, "base64").toString("utf-8"),
+    ]) {
+      try {
+        const decoded = decoder(raw);
+        if (decoded && decoded !== raw) {
+          lines.push(`      decoded: ${decoded.slice(0, 400)}`);
+          break;
+        }
+      } catch {
+        /* try the next decoder */
+      }
+    }
+  }
+
+  return lines;
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
@@ -98,6 +146,9 @@ async function main() {
   console.log(`  x-fe-version  : ${environment.feVersion || "(not sent)"}`);
   console.log(`  meta.stack    : ${environment.stack.split("\n")[1] ?? "-"}`);
   console.log(`  durableStream : ${environment.durableStream ? "yes" : "no"}`);
+  console.log(
+    `  cookies       : ${environment.cookies.length > 0 ? environment.cookies.join(", ") : "(none)"}`,
+  );
   console.log(`  api key       : ${config.apiKey ? "set" : "unset"}`);
   console.log(`  mode          : ${options.mode}`);
   if (options.jsa) console.log(`  replay jsa    : ${options.jsa.length} chars`);
@@ -148,6 +199,9 @@ async function main() {
         console.log(
           `[${index}] ${response.status} ${Date.now() - startedAt}ms ${detail}`,
         );
+        if (options.dump && response.status !== 200) {
+          for (const line of describeErrorPayload(body)) console.log(line);
+        }
       } catch (error) {
         statuses.push("exception");
         console.log(
