@@ -15,9 +15,11 @@ A high-performance OpenAI-compatible HTTP server that uses DuckDuckGo's AI backe
 - ✅ Image upload support\*
 - ✅ File upload support\*
 - ✅ Dynamic model list through the `X_MODELS_JSON` environment variable
-- ✅ Automatic recovery from DuckDuckGo's `418 I'm a teapot` challenge (retry with backoff)
+- ✅ Automatic recovery attempts for DuckDuckGo's `418 I'm a teapot` challenge (fresh VQD challenge per retry, backoff with jitter)
 - ✅ Automatic retry when DuckDuckGo returns an empty response
-- ✅ Rate limiting with intelligent backoff
+- ✅ Rate limiting with an atomic sliding window and upstream `429` penalties
+- ✅ Auto-discovery of the current duck.ai frontend version/stack (no manual header capture)
+- ✅ Optional API key protection
 - ✅ OpenAI-compatible error handling
 - ✅ CORS support
 - ✅ Health check endpoint
@@ -151,10 +153,10 @@ chmod 600 ~/.config/duckai/duckai.env
 $EDITOR ~/.config/duckai/duckai.env
 ```
 
-Fill in `X_FE_SIGNALS`, `X_FE_VERSION` and `X_VQD_STACK` as described in
-[Capturing the DuckDuckGo headers](#capturing-the-duckduckgo-headers). The
-example ships `HOST=0.0.0.0`; set it to `127.0.0.1` to keep the server
-reachable from localhost only.
+The server discovers the duck.ai frontend version by itself, so no headers
+have to be copied by hand — set `X_USER_AGENT` if you want a specific browser
+fingerprint. The example ships `HOST=0.0.0.0`; set it to `127.0.0.1` to keep the
+server reachable from localhost only.
 
 This file is parsed by systemd, not by a shell, so the syntax differs slightly
 from the `.env` file used by Docker:
@@ -253,7 +255,7 @@ systemctl --user daemon-reload
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `418 I'm a teapot` in the logs | `X_FE_SIGNALS`, `X_FE_VERSION` or `X_VQD_STACK` are stale. Capture them again from a live duck.ai session. |
+| `418 I'm a teapot` / `ERR_CHALLENGE` in the logs | duck.ai rejects the challenge intermittently (see [Reliability](#reliability)); a retry with a fresh challenge normally succeeds, which the server does on its own. If every attempt fails for minutes, run the probe (see [Diagnostics](#diagnostics)) to see whether the frontend version moved, and as a last resort set `X_USER_AGENT`/`X_VQD_STACK` by hand. |
 | `Failed to start server. Is port 3000 in use?` | Another process holds the port. Change `PORT` in `duckai.env` and restart the unit. |
 | The unit fails to start | `journalctl --user -u duckai -n 50` shows the reason. A missing binary shows up as `status=203/EXEC`. |
 | Configuration changes have no effect | The env file is read when the service starts. Run `systemctl --user restart duckai`. |
@@ -276,39 +278,54 @@ in the clone instead of `~/.config/duckai/duckai.env`.
 
 ## Configuration
 
-The server talks to DuckDuckGo's internal chat API, which expects a couple of browser headers. Capture them once from a real duck.ai session and put them in a `.env` file next to the project.
+The server talks to DuckDuckGo's internal chat API. It discovers the current frontend version and bundle URL itself, so in the default setup only the user agent has to be set.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `PORT` | No | `3000` | Port the HTTP server listens on |
 | `HOST` | No | `0.0.0.0` | Address the HTTP server binds to |
-| `X_USER_AGENT` | Recommended | Built-in Chrome UA | `User-Agent` used for the VQD challenge and the chat request |
-| `X_VQD_STACK` | Recommended | Built-in stack | Stack string of the DuckDuckGo frontend bundle used to answer the VQD challenge |
-| `X_FE_SIGNALS` | Yes | – | Value of the `x-fe-signals` header |
-| `X_FE_VERSION` | Yes | – | Value of the `x-fe-version` header |
+| `OPENAI_API_KEY` | No | – | When set, clients must send `Authorization: Bearer <key>`; otherwise the API is open to anyone who can reach it |
+| `X_USER_AGENT` | Recommended | Built-in Chrome UA | `User-Agent` sent to duck.ai, used for both the VQD and the chat request |
+| `X_ACCEPT_LANGUAGE` | No | `en-US,en;q=0.9` | `Accept-Language` sent to duck.ai |
+| `STREAM_KEY` | No | – | RSA-OAEP public key (`{"publicKey":{...}}`); adds `durableStream` to every request. Only relevant for resuming interrupted streams — generate one with `bun run stream-key` |
 | `X_EMIT_REASONING` | No | Off | Set to `1` or `true` to expose model reasoning as `reasoning_content` |
 | `X_MODELS_JSON` | No | Built-in list | JSON object that replaces the built-in model list |
+| `X_VQD_STACK` | No | auto-discovered | Overrides the `meta.stack` value of the VQD challenge |
+| `X_FE_VERSION` | No | auto-discovered | Overrides the `x-fe-version` header |
+| `X_MAX_REQUESTS_PER_MINUTE` | No | `20` | Client-side request budget per minute |
+| `X_MIN_REQUEST_INTERVAL_MS` | No | `1000` | Minimum delay between two outgoing requests |
+| `X_MAX_ATTEMPTS` | No | `3` | Attempts per chat request (`418`/`5xx`/timeouts) |
+| `X_RETRY_BASE_DELAY_MS` | No | `600` | Base delay of the retry backoff |
+| `X_RETRY_MAX_DELAY_MS` | No | `8000` | Upper bound of a single retry delay |
+| `X_DISCOVERY_TTL_MS` | No | `600000` | How long the discovered frontend version is cached |
+| `X_REQUEST_TIMEOUT_MS` | No | `120000` | Timeout for non-streaming upstream requests |
+| `X_STREAM_TIMEOUT_MS` | No | `600000` | Timeout for streaming upstream requests |
+| `X_MAX_BODY_BYTES` | No | `26214400` | Maximum accepted request body (25 MiB) |
 | `NODE_ENV` | No | – | `development` or `production` |
 
-### Capturing the DuckDuckGo headers
+### Capturing browser state
+
+The server discovers the current frontend version, its SHA and the duckai bundle URL from `https://duck.ai/` on its own, so nothing has to be copied from DevTools for a normal setup. `X_USER_AGENT` is the only header worth setting, and it has to be a real browser UA that is used consistently for both the VQD and the chat request.
+
+`STREAM_KEY` is optional and only needed if you want to send `durableStream`:
 
 1. Open <https://duck.ai> in a browser and send any message.
-2. Open DevTools → **Network** and pick the `https://duck.ai/duckchat/v1/chat` request.
-3. Under **Request Headers**, copy the values of `x-fe-signals`, `x-fe-version` and `User-Agent` into `X_FE_SIGNALS`, `X_FE_VERSION` and `X_USER_AGENT`.
-4. For `X_VQD_STACK`, run `new Error().stack` in the DevTools console while on duck.ai and copy the line pointing at `https://duck.ai/dist/duckai-dist/entry.duckai.<hash>.js`. It has to match the bundle DuckDuckGo currently serves — a stale value makes duck.ai reject the VQD challenge with `418`.
+2. Open DevTools → **Application** → **Local Storage** → `https://duck.ai`.
+3. Copy the value of `duckaiStreamsTestCredentials` (a JSON object) into `STREAM_KEY`. It contains a key pair and should never be shared.
+
+`X_VQD_STACK` and `X_FE_VERSION` stay available as manual overrides for the case where auto-discovery fails (for example because duck.ai changed its markup).
 
 ### `.env` example
 
 ```bash
 PORT=3000
-HOST=0.0.0.0
+HOST=127.0.0.1
 
 X_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-X_VQD_STACK=https://duck.ai/dist/duckai-dist/entry.duckai.750f07285be2b4e5c6de.js
-X_FE_SIGNALS=...
-X_FE_VERSION=serp_20260731_072906_ET-752772fde29f2a1b71d25121171ff64c52a12fc1
 
 # Optional
+# OPENAI_API_KEY=sk-local-secret
+# STREAM_KEY={"privateKey":{...},"publicKey":{...}}
 # X_EMIT_REASONING=1
 # X_MODELS_JSON={"my-model":{"reasoning_effort":"none"}}
 ```
@@ -545,13 +562,33 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ## Reliability
 
-DuckDuckGo's chat API answers with `418 I'm a teapot` whenever the client fingerprint does not add up. The server handles this for you:
+DuckDuckGo's chat API answers with `418 I'm a teapot` (`ERR_CHALLENGE`) whenever the client fingerprint does not add up. Everything the server does about it:
 
-- The `User-Agent` used for the VQD challenge and the chat request is always the same, and the browser-only VQD meta fields (`origin`, `stack`, `duration`) are filled in, so the challenge passes validation.
-- A `418` response is retried up to 5 times with an increasing delay between attempts.
-- An empty response is retried as well; only after all attempts fail does the server return an apology message.
+- One consistent fingerprint per process: the same `User-Agent` for the VQD and the chat request, browser-like `Accept`, `Accept-Language`, `Origin`, `Referer`, `Sec-Fetch-*`, `x-ddg-journey-id`, generated `x-fe-signals`, and the browser-only VQD `meta` fields (`origin`, `stack`, `duration`).
+- The frontend version, its SHA and the duckai bundle URL are read from `https://duck.ai/` and cached for `X_DISCOVERY_TTL_MS` (default 10 minutes), so a DuckDuckGo release cannot leave the server with a stale `x-fe-version`. A `418` invalidates that cache.
+- The VQD challenge is executed in a throwaway JSDOM document, and every retry fetches a *new* challenge — reusing the one that was just rejected only wastes requests.
+- Retries use exponential backoff with jitter (`X_MAX_ATTEMPTS`, default 3) and honour upstream `429` `Retry-After` values. Failures are surfaced with the upstream payload instead of a generic apology.
+- An empty completion is retried as well; only after all attempts fail does the server return an apology message.
 
-On top of that the server applies its own rate limiting: at most 20 requests per minute and at least one second between two requests.
+On top of that the server applies its own rate limiting: at most `X_MAX_REQUESTS_PER_MINUTE` (20) requests per minute and at least `X_MIN_REQUEST_INTERVAL_MS` (1s) between two requests. The check and the bookkeeping happen under a lock, so concurrent requests cannot overrun the budget.
+
+### What actually causes `418` (measured against the live API)
+
+- **It is intermittent, not a fingerprint bug.** The same process, same headers, same challenge code alternates between `200` and `418`. Rejections cluster on the *first* request after an idle period and clear up on the next attempt: in a measured run, `durableStream`-less retries produced `418` on attempt 1 and `200` on attempt 2, two seconds later. Retrying with a *fresh* challenge is therefore the fix; reusing the rejected one just burns requests.
+- **A JSDOM-solved challenge is accepted.** `x-vqd-hash-1` computed by the server's throwaway JSDOM document passes; no browser, no `durableStream` and no `x-fe-signals` replay is involved.
+- **A challenge solved in a real browser is transportable** — a `jsa` captured in Firefox on Android was accepted, unchanged, from a Termux client on another network.
+- **`400` and `418` mean different things.** `400 ERR_BAD_REQUEST` is a body/schema rejection: DuckDuckGo's current API requires `metadata` (`customization` + `toolChoice`) and, for models that advertise it, `reasoningEffort`. Without them every request fails with `400` *regardless* of the challenge. The server always fills both in, so a `400` in the logs points at a shape change rather than at anti-bot.
+- **User agent and client hints do not decide the outcome.** Firefox and Chrome UAs, with and without `Sec-CH-UA`, were each observed both passing and failing; changing the UA is not a cure for `418`.
+
+> **Note on `durableStream`.** It is *not* a new-chat field. The duck.ai
+> frontend sends `durableStream` only when it resumes a stream that was
+> interrupted, and it fills `messageId` from `meta.recovery.messageId` of the
+> conversation it is continuing; a fresh chat carries no `durableStream` at all.
+> The key pair is generated in the browser (WebCrypto, RSA-OAEP-256) and kept in
+> `localStorage` as `duckaiStreamsTestCredentials` — nothing is issued by the
+> server, so `bun run stream-key` produces an equivalent value. Measured on a
+> live API, adding `durableStream` to a normal request does **not** change the
+> `418` outcome, so treat it purely as a parity option.
 
 ## Usage with Docker
 
@@ -587,9 +624,68 @@ bun test              # all tests
 bun run test:openai   # simple OpenAI SDK test
 bun run test:tools    # tool calling tests
 bun run test:e2e      # end-to-end tool calling test
+bun run typecheck     # tsc --noEmit
 ```
 
 The test suite talks to the live duck.ai backend, so it depends on your `.env` values and on DuckDuckGo being reachable.
+
+### Diagnostics
+
+`scripts/duck-probe.ts` sends real requests and prints the raw upstream status
+codes, which is the only reliable way to compare fingerprints or measure the
+`418` failure rate:
+
+```bash
+bun run probe                   # 3 raw requests
+bun run probe --count=10        # more samples
+bun run probe --mode=chat       # full server path (retries included)
+bun run probe --jsa=<base64>    # replay an x-vqd-hash-1 value captured in
+                                # DevTools, to test whether it is accepted at all
+```
+
+Both modes build the upstream body through the same `validateRequest` +
+`transformToDuckAIRequest` pair the HTTP server uses, so the raw status is
+meaningful: `418` is a rejected challenge (intermittent, see
+[Reliability](#reliability)), `400` is a body/schema problem, `429` is the
+per-IP rate limit.
+
+#### No DevTools? Use the userscript
+
+`scripts/duckai-jsa.user.js` is a userscript for Violentmonkey/Tampermonkey. It
+computes the challenge in a real browser (instead of JSDOM on the server), can
+send requests with exactly the headers the server sends, and prints a JSON blob
+with `userAgent`/`jsa` for a run from Termux:
+
+1. Install the userscript, open <https://duck.ai> and send any message.
+2. "Тест (наши заголовки)" sends a request with the server's header set and a
+   freshly computed jsa. A `200` there means the headers and the jsa logic are
+   not the problem.
+3. "Скопировать" copies the JSON. Use `jsa` and `userAgent` in Termux:
+
+```bash
+X_USER_AGENT='<userAgent from the JSON>' bun run probe --jsa='<jsa from the JSON>'
+```
+
+A browser-solved challenge is transportable: a jsa captured in Firefox on
+Android was accepted from Termux on a different network, so the transport is not
+what duck.ai inspects. Keep in mind that the challenge is bound to the
+`User-Agent` it was solved for, which is why `X_USER_AGENT` has to be set to the
+captured `userAgent`.
+
+Example output:
+
+```
+fingerprint:
+  user-agent    : Mozilla/5.0 (Windows NT 10.0; Win64; x64) ... Chrome/138.0.0.0
+  x-fe-version  : serp_20261029_190910_ET-0da0684bfbaea723b9f4adaf3c8b04d0c6c0b89d
+  meta.stack    :     at https://duck.ai/dist/duckai-dist/entry.duckai.9ec4b19a00de1621e70e.js:2:1308110
+  durableStream : no
+
+[0] 418 941ms {"action":"error","status":418,"type":"ERR_CHALLENGE",...}
+```
+
+Keep the sample count low: duck.ai starts answering `429 ERR_RATE_LIMIT` after a
+couple of rejected challenges, and that hides the real failure mode.
 
 ## What's new in this fork
 
