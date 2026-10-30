@@ -86,9 +86,10 @@ export class SharedRateLimitTester {
       try {
         const startTime = Date.now();
 
-        const response = await this.duckAI.chat({
-          model: "gpt-4o-mini",
+        await this.duckAI.chat({
+          model: "gpt-6-luna",
           messages: [{ role: "user", content: `Shared test request ${i}` }],
+          canUseTools: false,
         });
 
         const endTime = Date.now();

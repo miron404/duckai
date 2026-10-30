@@ -1,5 +1,4 @@
 import { ChatCompletionContentPart } from "openai/src/resources.js";
-import { ChatCompletionReasoningEffort } from "openai/src/resources/chat/completions.js";
 import { DuckAIReasoningEffort } from "./models";
 
 // OpenAI API Types
@@ -92,7 +91,7 @@ export interface ChatCompletionRequest {
   stop?: string | string[];
   tools?: ToolDefinition[];
   tool_choice?: ToolChoice;
-  reasoning_effort: DuckAIReasoningEffort;
+  reasoning_effort?: DuckAIReasoningEffort;
 }
 
 export interface ChatCompletionChoice {
@@ -147,8 +146,10 @@ export interface ModelsResponse {
 
 // Duck.ai specific types
 export interface VQDResponse {
-  // vqd: string; // looks unused to me
+  /** Encoded `x-vqd-hash-1` value. */
   hash: string;
+  /** `x-fe-version` value derived from the same frontend snapshot. */
+  version?: string;
 }
 
 export interface DuckAIMetadata {
@@ -164,12 +165,20 @@ export interface DuckAIMetadata {
   };
 }
 
+/** Optional E2E key requested by the current duck.ai frontend. */
+export interface DuckAIDurableStream {
+  conversationId: string;
+  messageId: string;
+  publicKey: object;
+}
+
 export interface DuckAIRequest {
   model: string;
   messages: DuckChatCompletionMessage[];
   metadata?: DuckAIMetadata;
   reasoningEffort?: DuckAIReasoningEffort;
   canUseTools: boolean;
+  durableStream?: DuckAIDurableStream;
 }
 
 export interface DuckAIChatResult {

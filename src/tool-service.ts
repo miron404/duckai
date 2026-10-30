@@ -3,7 +3,6 @@ import {
   ToolCall,
   ToolChoice,
   ChatCompletionMessage,
-  FunctionDefinition,
 } from "./types";
 
 export class ToolService {

@@ -216,7 +216,7 @@ describe("OpenAIService with Tools", () => {
 
       // Mock the DuckAI response
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "I'm doing well, thank you!";
+      openAIService["duckAI"].chat = async () => ({ content: "I'm doing well, thank you!" });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -240,7 +240,7 @@ describe("OpenAIService with Tools", () => {
       // Mock the DuckAI response to return a function call
       const originalChat = openAIService["duckAI"].chat;
       openAIService["duckAI"].chat = async () =>
-        JSON.stringify({
+        ({ content: JSON.stringify({
           tool_calls: [
             {
               id: "call_1",
@@ -251,7 +251,7 @@ describe("OpenAIService with Tools", () => {
               },
             },
           ],
-        });
+        }) });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -284,7 +284,7 @@ describe("OpenAIService with Tools", () => {
           "You MUST call at least one function"
         );
 
-        return JSON.stringify({
+        return ({ content: JSON.stringify({
           tool_calls: [
             {
               id: "call_1",
@@ -295,7 +295,7 @@ describe("OpenAIService with Tools", () => {
               },
             },
           ],
-        });
+        }) });
       };
 
       const response = await openAIService.createChatCompletion(request);
@@ -316,7 +316,7 @@ describe("OpenAIService with Tools", () => {
       // Mock the DuckAI response
       const originalChat = openAIService["duckAI"].chat;
       openAIService["duckAI"].chat = async () =>
-        "Hello! How can I help you today?";
+        ({ content: "Hello! How can I help you today?" });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -342,7 +342,7 @@ describe("OpenAIService with Tools", () => {
       // Mock the DuckAI response to include function calls
       const originalChat = openAIService["duckAI"].chat;
       openAIService["duckAI"].chat = async () =>
-        JSON.stringify({
+        ({ content: JSON.stringify({
           tool_calls: [
             {
               id: "call_1",
@@ -353,7 +353,7 @@ describe("OpenAIService with Tools", () => {
               },
             },
           ],
-        });
+        }) });
 
       const stream = await openAIService.createChatCompletionStream(request);
       const chunks: string[] = [];
@@ -386,7 +386,7 @@ describe("OpenAIService with Tools", () => {
 
       // Mock the DuckAI response
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "Hello! How can I help you?";
+      openAIService["duckAI"].chat = async () => ({ content: "Hello! How can I help you?" });
 
       const stream = await openAIService.createChatCompletionStream(request);
       const chunks: string[] = [];
@@ -427,7 +427,7 @@ describe("OpenAIService with Tools", () => {
 
       // Mock the DuckAI response
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "I'll calculate that for you.";
+      openAIService["duckAI"].chat = async () => ({ content: "I'll calculate that for you." });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -452,7 +452,7 @@ describe("OpenAIService with Tools", () => {
 
       // Mock empty response
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "";
+      openAIService["duckAI"].chat = async () => ({ content: "" });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -492,7 +492,7 @@ describe("OpenAIService with Tools", () => {
       // Mock the DuckAI response
       const originalChat = openAIService["duckAI"].chat;
       openAIService["duckAI"].chat = async () =>
-        "The time is 2024-01-15T10:30:00Z. Now let me calculate 2+2.";
+        ({ content: "The time is 2024-01-15T10:30:00Z. Now let me calculate 2+2." });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -608,7 +608,7 @@ describe("OpenAIService with Tools", () => {
 
       // Mock the DuckAI response
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "I'll help you with that.";
+      openAIService["duckAI"].chat = async () => ({ content: "I'll help you with that." });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -635,7 +635,7 @@ describe("OpenAIService with Tools", () => {
 
       // Mock empty response to trigger fallback
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "";
+      openAIService["duckAI"].chat = async () => ({ content: "" });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -670,7 +670,7 @@ describe("OpenAIService with Tools", () => {
 
       // Mock empty response to trigger fallback
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "";
+      openAIService["duckAI"].chat = async () => ({ content: "" });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -700,7 +700,7 @@ describe("OpenAIService with Tools", () => {
       // Mock response with mixed content and function call
       const originalChat = openAIService["duckAI"].chat;
       openAIService["duckAI"].chat = async () =>
-        JSON.stringify({
+        ({ content: JSON.stringify({
           message: "Hello! Let me check the time for you.",
           tool_calls: [
             {
@@ -712,7 +712,7 @@ describe("OpenAIService with Tools", () => {
               },
             },
           ],
-        });
+        }) });
 
       const response = await openAIService.createChatCompletion(request);
 

@@ -1,4 +1,11 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -72,7 +79,11 @@ export class RateLimitStore {
         lastUpdated: Date.now(),
       };
 
-      writeFileSync(this.storeFile, JSON.stringify(storeData, null, 2));
+      // Write-then-rename keeps the file readable for other processes even if
+      // this one dies mid-write.
+      const tempFile = `${this.storeFile}.${process.pid}.tmp`;
+      writeFileSync(tempFile, JSON.stringify(storeData, null, 2));
+      renameSync(tempFile, this.storeFile);
     } catch (error) {
       console.warn("Failed to write rate limit store:", error);
     }
@@ -93,8 +104,7 @@ export class RateLimitStore {
   clear(): void {
     try {
       if (existsSync(this.storeFile)) {
-        const fs = require("fs");
-        fs.unlinkSync(this.storeFile);
+        unlinkSync(this.storeFile);
       }
     } catch (error) {
       console.warn("Failed to clear rate limit store:", error);

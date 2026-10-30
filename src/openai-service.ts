@@ -1,4 +1,3 @@
-import { ChatCompletionContentPart } from "openai/src/resources.js";
 import { DuckAI } from "./duckai";
 import { ToolService } from "./tool-service";
 import type {
@@ -8,15 +7,10 @@ import type {
   ChatCompletionMessage,
   ModelsResponse,
   Model,
-  DuckAIRequest,
-  ToolDefinition,
   ToolCall,
   DuckAIMetadata,
-  DuckChatCompletionContentPart,
-  DuckChatCompletionMessage,
-  DuckChatCompletionContentPartImage,
 } from "./types";
-import { DUCKAI_MODELS } from "./models";
+import { ValidationError } from "./errors";
 
 export class OpenAIService {
   private duckAI: DuckAI;
@@ -75,6 +69,29 @@ export class OpenAIService {
     return Math.ceil(text.length / 4);
   }
 
+  /** Flattens OpenAI message content (string | parts | null) into plain text. */
+  private contentToText(content: ChatCompletionMessage["content"]): string {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+      .map((part) => {
+        if (part && typeof part === "object" && "text" in part) {
+          const text = (part as { text?: unknown }).text;
+          return typeof text === "string" ? text : "";
+        }
+        return "";
+      })
+      .filter((text) => text.length > 0)
+      .join("\n");
+  }
+
+  private messagesToText(messages: ChatCompletionMessage[]): string {
+    return messages
+      .map((message) => this.contentToText(message.content))
+      .filter((text) => text.length > 0)
+      .join(" ");
+  }
+
   async createChatCompletion(
     request: ChatCompletionRequest,
   ): Promise<ChatCompletionResponse> {
@@ -96,8 +113,9 @@ export class OpenAIService {
     const created = this.getCurrentTimestamp();
 
     // Calculate token usage
-    const promptText = request.messages.map((m) => m.content || "").join(" ");
-    const promptTokens = this.estimateTokens(promptText);
+    const promptTokens = this.estimateTokens(
+      this.messagesToText(request.messages),
+    );
     const completionTokens = this.estimateTokens(response);
 
     return {
@@ -134,7 +152,9 @@ export class OpenAIService {
     if (request.tools) {
       const validation = this.toolService.validateTools(request.tools);
       if (!validation.valid) {
-        throw new Error(`Invalid tools: ${validation.errors.join(", ")}`);
+        throw new ValidationError(
+          `Invalid tools: ${validation.errors.join(", ")}`,
+        );
       }
     }
 
@@ -169,10 +189,9 @@ Please follow these instructions when responding to the following user message.`
 
       if (toolCalls.length > 0) {
         // Calculate token usage
-        const promptText = modifiedMessages
-          .map((m) => m.content || "")
-          .join(" ");
-        const promptTokens = this.estimateTokens(promptText);
+        const promptTokens = this.estimateTokens(
+          this.messagesToText(modifiedMessages),
+        );
         const completionTokens = this.estimateTokens(response);
 
         return {
@@ -276,8 +295,9 @@ Please follow these instructions when responding to the following user message.`
         },
       };
 
-      const promptText = modifiedMessages.map((m) => m.content || "").join(" ");
-      const promptTokens = this.estimateTokens(promptText);
+      const promptTokens = this.estimateTokens(
+        this.messagesToText(modifiedMessages),
+      );
       const completionTokens = this.estimateTokens(
         JSON.stringify(forcedToolCall),
       );
@@ -307,8 +327,9 @@ Please follow these instructions when responding to the following user message.`
     }
 
     // No function calls detected, return normal response
-    const promptText = modifiedMessages.map((m) => m.content || "").join(" ");
-    const promptTokens = this.estimateTokens(promptText);
+    const promptTokens = this.estimateTokens(
+      this.messagesToText(modifiedMessages),
+    );
     const completionTokens = this.estimateTokens(response);
 
     return {
@@ -354,69 +375,58 @@ Please follow these instructions when responding to the following user message.`
     const id = this.generateId();
     const created = this.getCurrentTimestamp();
 
-    return new ReadableStream({
-      start(controller) {
-        const reader = duckStream.getReader();
-        let isFirst = true;
+    const encoder = new TextEncoder();
+    const reader = duckStream.getReader();
+    let isFirst = true;
 
-        function pump(): Promise<void> {
-          return reader.read().then(({ done, value }) => {
-            if (done) {
-              // Send final chunk
-              const finalChunk: ChatCompletionStreamResponse = {
-                id,
-                object: "chat.completion.chunk",
-                created,
-                model: request.model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: {},
-                    finish_reason: "stop",
-                  },
-                ],
-              };
+    const finish = (
+      controller: ReadableStreamDefaultController<Uint8Array>,
+      finishReason: "stop" | "tool_calls",
+    ) => {
+      const finalChunk: ChatCompletionStreamResponse = {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model: request.model,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+      };
+      controller.enqueue(
+        encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`),
+      );
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    };
 
-              const finalData = `data: ${JSON.stringify(finalChunk)}\n\n`;
-              const finalDone = `data: [DONE]\n\n`;
-
-              controller.enqueue(new TextEncoder().encode(finalData));
-              controller.enqueue(new TextEncoder().encode(finalDone));
-              controller.close();
-              return;
-            }
-
-            const delta: ChatCompletionStreamResponse["choices"][0]["delta"] =
-              isFirst ? { role: "assistant" } : {};
-            if (value.type === "reasoning") {
-              delta.reasoning_content = value.text;
-            } else {
-              delta.content = value.text;
-            }
-
-            const chunk: ChatCompletionStreamResponse = {
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model: request.model,
-              choices: [
-                {
-                  index: 0,
-                  delta,
-                  finish_reason: null,
-                },
-              ],
-            };
-
-            isFirst = false;
-            const data = `data: ${JSON.stringify(chunk)}\n\n`;
-            controller.enqueue(new TextEncoder().encode(data));
-
-            return pump();
-          });
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) {
+          finish(controller, "stop");
+          return;
         }
 
-        return pump();
+        const delta: ChatCompletionStreamResponse["choices"][0]["delta"] =
+          isFirst ? { role: "assistant" } : {};
+        if (value.type === "reasoning") {
+          delta.reasoning_content = value.text;
+        } else {
+          delta.content = value.text;
+        }
+
+        const chunk: ChatCompletionStreamResponse = {
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: request.model,
+          choices: [{ index: 0, delta, finish_reason: null }],
+        };
+
+        isFirst = false;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      },
+      cancel(reason) {
+        // Client disconnected: do not keep the duck.ai response open.
+        reader.cancel(reason).catch(() => {});
       },
     });
   }
@@ -566,67 +576,99 @@ Please follow these instructions when responding to the following user message.`
     };
   }
 
+  /**
+   * Validates the incoming request and normalises it for duck.ai.
+   *
+   * System/developer messages are hoisted into
+   * `metadata.customization.additionalInstructions` because duck.ai has no
+   * system role; the caller's array is never mutated.
+   */
   validateRequest(request: any): ChatCompletionRequest {
-    if (!request.messages || !Array.isArray(request.messages)) {
-      throw new Error("messages field is required and must be an array");
+    if (!request || typeof request !== "object") {
+      throw new ValidationError("Request body must be a JSON object");
+    }
+    if (!Array.isArray(request.messages)) {
+      throw new ValidationError("messages field is required and must be an array");
+    }
+    if (request.messages.length === 0) {
+      throw new ValidationError("messages array cannot be empty");
     }
 
-    if (request.messages.length === 0) {
-      throw new Error("messages array cannot be empty");
-    }
+    const conversation: ChatCompletionMessage[] = [];
+    const instructions: string[] = [];
 
     for (const message of request.messages as ChatCompletionMessage[]) {
       if (
+        !message ||
+        typeof message !== "object" ||
         !message.role ||
         !["system", "developer", "user", "assistant", "tool"].includes(
           message.role,
         )
       ) {
-        throw new Error(
-          "Each message must have a valid role (system, user, assistant, or tool)",
+        throw new ValidationError(
+          "Each message must have a valid role (system, developer, user, assistant, or tool)",
         );
-      }
-
-      // Normalize developer role to system
-      if (message.role === "developer") {
-        message.role = "system";
       }
 
       // Tool messages have different validation rules
       if (message.role === "tool") {
         if (!message.tool_call_id) {
-          throw new Error("Tool messages must have a tool_call_id");
+          throw new ValidationError("Tool messages must have a tool_call_id");
         }
         if (typeof message.content !== "string") {
-          throw new Error("Tool messages must have content as a string");
+          throw new ValidationError("Tool messages must have content as a string");
         }
-      } else {
+      } else if (
+        message.content === undefined ||
+        (message.content !== null &&
+          typeof message.content !== "string" &&
+          !Array.isArray(message.content))
+      ) {
         // For non-tool messages, content can be null if there are tool_calls
-        if (
-          message.content === undefined ||
-          (message.content !== null &&
-            typeof message.content !== "string" &&
-            !Array.isArray(message.content))
-        ) {
-          throw new Error(
-            "Each message must have content as a string, array (for images), or null",
-          );
-        }
+        throw new ValidationError(
+          "Each message must have content as a string, array (for images), or null",
+        );
       }
+
+      if (message.role === "system" || message.role === "developer") {
+        const text = this.contentToText(message.content);
+        if (text) instructions.push(text);
+        continue;
+      }
+
+      // duck.ai only knows user/assistant turns, so keep tool results in the
+      // conversation but let them reach the model as regular text.
+      if (message.role === "tool") {
+        conversation.push({
+          role: "user",
+          content: `[tool result for ${message.tool_call_id}]\n${message.content}`,
+        });
+        continue;
+      }
+
+      conversation.push(message);
+    }
+
+    if (conversation.length === 0) {
+      throw new ValidationError(
+        "messages must contain at least one user or assistant message",
+      );
     }
 
     // Validate tools if provided
     if (request.tools) {
       const validation = this.toolService.validateTools(request.tools);
       if (!validation.valid) {
-        throw new Error(`Invalid tools: ${validation.errors.join(", ")}`);
+        throw new ValidationError(
+          `Invalid tools: ${validation.errors.join(", ")}`,
+        );
       }
     }
 
-    // support for system prompt
-    var metadata: DuckAIMetadata = {
+    const metadata: DuckAIMetadata = {
       customization: {
-        additionalInstructions: "",
+        additionalInstructions: instructions.join("\n\n"),
         shouldSeekClarity: false,
       },
       toolChoice: {
@@ -636,15 +678,11 @@ Please follow these instructions when responding to the following user message.`
         WeatherForecast: false,
       },
     };
-    if (request.messages[0].role == "system") {
-      metadata.customization.additionalInstructions =
-        request.messages.shift().content;
-    }
 
     return {
       model: request.model || "gpt-6-luna",
-      messages: request.messages,
-      metadata: metadata,
+      messages: conversation,
+      metadata,
       temperature: request.temperature,
       max_tokens: request.max_tokens,
       stream: request.stream || false,

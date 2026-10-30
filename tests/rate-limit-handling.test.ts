@@ -79,7 +79,7 @@ describe("Rate Limiting and Error Handling", () => {
 
       // Mock Duck.ai to return empty response
       const originalChat = openAIService["duckAI"].chat;
-      openAIService["duckAI"].chat = async () => "";
+      openAIService["duckAI"].chat = async () => ({ content: "" });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -132,7 +132,7 @@ describe("Rate Limiting and Error Handling", () => {
       // Mock Duck.ai to return malformed response
       const originalChat = openAIService["duckAI"].chat;
       openAIService["duckAI"].chat = async () =>
-        "This is not JSON and not a function call";
+        ({ content: "This is not JSON and not a function call" });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -157,7 +157,7 @@ describe("Rate Limiting and Error Handling", () => {
       // Mock Duck.ai to return partial JSON
       const originalChat = openAIService["duckAI"].chat;
       openAIService["duckAI"].chat = async () =>
-        '{"tool_calls": [{"id": "call_1", "type": "function"';
+        ({ content: '{"tool_calls": [{"id": "call_1", "type": "function"' });
 
       const response = await openAIService.createChatCompletion(request);
 
@@ -172,11 +172,14 @@ describe("Rate Limiting and Error Handling", () => {
 
   describe("Resilience Testing", () => {
     it("should handle rapid consecutive requests", async () => {
-      const requests = Array.from({ length: 5 }, (_, i) => ({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: `Test message ${i}` }],
-        tools: sampleTools,
-      }));
+      const requests = Array.from(
+        { length: 5 },
+        (_, i): ChatCompletionRequest => ({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: `Test message ${i}` }],
+          tools: sampleTools,
+        }),
+      );
 
       // Mock Duck.ai with varying responses
       const originalChat = openAIService["duckAI"].chat;
@@ -186,7 +189,7 @@ describe("Rate Limiting and Error Handling", () => {
         if (callCount % 2 === 0) {
           throw new Error("Rate limited");
         }
-        return `Response ${callCount}`;
+        return ({ content: `Response ${callCount}` });
       };
 
       const results = await Promise.allSettled(

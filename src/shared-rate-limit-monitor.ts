@@ -1,4 +1,5 @@
 import { RateLimitStore } from "./rate-limit-store";
+import { config } from "./config";
 
 /**
  * Shared Rate Limit Monitor
@@ -11,11 +12,6 @@ export class SharedRateLimitMonitor {
   private rateLimitStore: RateLimitStore;
   private monitoringInterval?: NodeJS.Timeout;
 
-  // Rate limit constants (should match DuckAI class)
-  private readonly MAX_REQUESTS_PER_MINUTE = 20;
-  private readonly WINDOW_SIZE_MS = 60 * 1000; // 1 minute
-  private readonly MIN_REQUEST_INTERVAL_MS = 1000; // 1 second
-
   constructor() {
     this.rateLimitStore = new RateLimitStore();
   }
@@ -25,7 +21,7 @@ export class SharedRateLimitMonitor {
    */
   private cleanOldTimestamps(timestamps: number[]): number[] {
     const now = Date.now();
-    const cutoff = now - this.WINDOW_SIZE_MS;
+    const cutoff = now - config.windowSizeMs;
     return timestamps.filter((timestamp) => timestamp > cutoff);
   }
 
@@ -39,8 +35,8 @@ export class SharedRateLimitMonitor {
       // No data available, return default state
       return {
         requestsInCurrentWindow: 0,
-        maxRequestsPerMinute: this.MAX_REQUESTS_PER_MINUTE,
-        timeUntilWindowReset: this.WINDOW_SIZE_MS,
+        maxRequestsPerMinute: config.maxRequestsPerMinute,
+        timeUntilWindowReset: config.windowSizeMs,
         isCurrentlyLimited: false,
         recommendedWaitTime: 0,
         utilizationPercentage: 0,
@@ -64,17 +60,17 @@ export class SharedRateLimitMonitor {
       // For sliding window, calculate when the oldest request will expire
       const oldestTimestamp = cleanTimestamps[0];
       timeUntilReset = oldestTimestamp
-        ? Math.max(0, oldestTimestamp + this.WINDOW_SIZE_MS - now)
+        ? Math.max(0, oldestTimestamp + config.windowSizeMs - now)
         : 0;
     } else {
       // Old fixed window format (backward compatibility)
       const windowElapsed = now - (stored.windowStart || 0);
       requestsInWindow = stored.requestCount || 0;
-      timeUntilReset = this.WINDOW_SIZE_MS - windowElapsed;
+      timeUntilReset = config.windowSizeMs - windowElapsed;
 
-      if (windowElapsed >= this.WINDOW_SIZE_MS) {
+      if (windowElapsed >= config.windowSizeMs) {
         requestsInWindow = 0;
-        timeUntilReset = this.WINDOW_SIZE_MS;
+        timeUntilReset = config.windowSizeMs;
       }
     }
 
@@ -82,15 +78,15 @@ export class SharedRateLimitMonitor {
     const timeSinceLastRequest = now - stored.lastRequestTime;
     const recommendedWait = Math.max(
       0,
-      this.MIN_REQUEST_INTERVAL_MS - timeSinceLastRequest
+      config.minRequestIntervalMs - timeSinceLastRequest
     );
 
     const utilizationPercentage =
-      (requestsInWindow / this.MAX_REQUESTS_PER_MINUTE) * 100;
+      (requestsInWindow / config.maxRequestsPerMinute) * 100;
 
     return {
       requestsInCurrentWindow: requestsInWindow,
-      maxRequestsPerMinute: this.MAX_REQUESTS_PER_MINUTE,
+      maxRequestsPerMinute: config.maxRequestsPerMinute,
       timeUntilWindowReset: Math.max(0, timeUntilReset),
       isCurrentlyLimited: stored.isLimited,
       recommendedWaitTime: recommendedWait,
@@ -290,7 +286,12 @@ export class SharedRateLimitMonitor {
 }
 
 // CLI usage for shared monitoring
-if (require.main === module) {
+const isDirectRun =
+  typeof require !== "undefined" &&
+  typeof module !== "undefined" &&
+  require.main === module;
+
+if (isDirectRun) {
   const monitor = new SharedRateLimitMonitor();
 
   // Parse command line arguments

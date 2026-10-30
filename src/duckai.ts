@@ -1,6 +1,10 @@
 import { JSDOM } from "jsdom";
+import { createHash, randomUUID } from "node:crypto";
 import { RateLimitStore } from "./rate-limit-store";
 import { SharedRateLimitMonitor } from "./shared-rate-limit-monitor";
+import { DUCKAI_MODELS } from "./models";
+import { config } from "./config";
+import { RateLimitError, UpstreamError, ValidationError } from "./errors";
 import type {
   ChatCompletionMessage,
   VQDResponse,
@@ -11,12 +15,38 @@ import type {
   ChatCompletionRequest,
   DuckChatCompletionContentPartImage,
   DuckChatCompletionContentPartFile,
+  DuckChatCompletionContentPart,
 } from "./types";
-import { createHash } from "node:crypto";
-import { Buffer } from "node:buffer";
-import { DUCKAI_MODELS } from "./models";
-import { ChatCompletionContentPart } from "openai/src/resources.js";
-import { sleep } from "bun";
+import type { ChatCompletionContentPart } from "openai/src/resources.js";
+
+const DUCKAI_ORIGIN = "https://duck.ai";
+const DUCKAI_STATUS_URL = `${DUCKAI_ORIGIN}/duckchat/v1/status`;
+const DUCKAI_CHAT_URL = `${DUCKAI_ORIGIN}/duckchat/v1/chat`;
+const DEFAULT_STACK_URL = `${DUCKAI_ORIGIN}/dist/duckai-dist/entry.duckai.js`;
+
+/** Stand-in used when duck.ai keeps returning empty completions. */
+const EMPTY_RESPONSE_FALLBACK =
+  "I apologize, but I'm unable to provide a response at the moment. Please try again.";
+
+/** Marks the offscreen document the challenge script runs in (see JSDOM below). */
+const CHALLENGE_DOCUMENT = `<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline';">
+</head>
+<body></body>
+</html>`;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * duck.ai expects the same client fingerprint on every request, so one journey
+ * id per process is enough (the real client keeps it per browser session).
+ */
+const JOURNEY_ID = Array.from({ length: 32 }, () =>
+  "0123456789abcdef"[Math.floor(Math.random() * 16)],
+).join("");
 
 // Rate limiting tracking with sliding window
 interface RateLimitInfo {
@@ -24,6 +54,70 @@ interface RateLimitInfo {
   lastRequestTime: number;
   isLimited: boolean;
   retryAfter?: number;
+}
+
+/** Version/stack of the frontend bundle currently served by duck.ai. */
+interface FrontendInfo {
+  version: string;
+  sha: string;
+  stack: string;
+  fetchedAt: number;
+}
+
+interface UpstreamErrorPayload {
+  status?: number;
+  type?: string;
+  message: string;
+}
+
+function truncate(value: string, limit = 300): string {
+  return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+/** Parses the `{"action":"error",...}` body duck.ai sends on failures. */
+function parseUpstreamErrorPayload(body: string): UpstreamErrorPayload | null {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith("{")) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!parsed || parsed.action !== "error") return null;
+  const status = typeof parsed.status === "number" ? parsed.status : undefined;
+  const type = typeof parsed.type === "string" ? parsed.type : undefined;
+  return {
+    status,
+    type,
+    message: `duck.ai error${type ? ` ${type}` : ""}${status ? ` (${status})` : ""}: ${truncate(trimmed)}`,
+  };
+}
+
+function isRetryableStatus(status: number): boolean {
+  return (
+    status === 418 || status === 429 || status === 500 || status === 502 ||
+    status === 503 || status === 504
+  );
+}
+
+/** Parses `data:<mime>[;<encoding>],<payload>` URLs used for files/images. */
+function parseDataUrl(dataUrl: string): {
+  mimeType: string;
+  encoding: string;
+  data: string;
+} {
+  const match = /^data:([^;,]*)(?:;([^,]*))?,([\s\S]*)$/.exec(dataUrl);
+  if (!match) {
+    throw new ValidationError(
+      "File payload must be a data URL (data:<mime>[;base64],<payload>)",
+    );
+  }
+  return {
+    mimeType: match[1] || "application/octet-stream",
+    encoding: match[2] || "base64",
+    data: match[3],
+  };
 }
 
 export class DuckAI {
@@ -35,31 +129,12 @@ export class DuckAI {
   private rateLimitStore: RateLimitStore;
   private rateLimitMonitor: SharedRateLimitMonitor;
 
-  // Conservative rate limiting - adjust based on observed limits
-  private readonly MAX_REQUESTS_PER_MINUTE = 20;
-  private readonly WINDOW_SIZE_MS = 60 * 1000; // 1 minute
-  private readonly MIN_REQUEST_INTERVAL_MS = 1000; // 1 second between requests
+  /** Cached frontend version/stack, refreshed on a TTL and after a 418. */
+  private discovery: FrontendInfo | null = null;
+  private discoveryInFlight: Promise<FrontendInfo> | null = null;
 
-  // Defaults used when the corresponding env var is unset. These mimic what
-  // duck.ai's web client currently sends and need to match what gets hashed
-  // into the VQD challenge response.
-  private static readonly DEFAULT_USER_AGENT =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
-  private static readonly DEFAULT_VQD_STACK =
-    "l@https://duck.ai/dist/duckai-dist/entry.duckai.c9340e95bd2f7fdc3302.js:2:1308110\n";
-
-  private get userAgent(): string {
-    return process.env.X_USER_AGENT || DuckAI.DEFAULT_USER_AGENT;
-  }
-
-  private get vqdStack(): string {
-    return process.env.X_VQD_STACK || DuckAI.DEFAULT_VQD_STACK;
-  }
-
-  private get emitReasoning(): boolean {
-    const v = process.env.X_EMIT_REASONING;
-    return v === "1" || v === "true";
-  }
+  /** Serialises the "check limits, then record the request" critical section. */
+  private slotLock: Promise<void> = Promise.resolve();
 
   constructor() {
     this.rateLimitStore = new RateLimitStore();
@@ -67,59 +142,57 @@ export class DuckAI {
     this.loadRateLimitFromStore();
   }
 
-  /**
-   * Clean old timestamps outside the sliding window
-   */
+  // ---------------------------------------------------------------- rate limit
+
   private cleanOldTimestamps(): void {
     const now = Date.now();
-    const cutoff = now - this.WINDOW_SIZE_MS;
+    const cutoff = now - config.windowSizeMs;
     this.rateLimitInfo.requestTimestamps =
       this.rateLimitInfo.requestTimestamps.filter(
         (timestamp) => timestamp > cutoff,
       );
   }
 
-  /**
-   * Get current request count in sliding window
-   */
   private getCurrentRequestCount(): number {
     this.cleanOldTimestamps();
     return this.rateLimitInfo.requestTimestamps.length;
   }
 
-  /**
-   * Load rate limit data from shared store
-   */
   private loadRateLimitFromStore(): void {
     const stored = this.rateLimitStore.read();
-    if (stored) {
-      // Convert old format to new sliding window format if needed
-      const storedAny = stored as any;
-      if ("requestCount" in storedAny && "windowStart" in storedAny) {
-        // Old format - convert to new format (start fresh)
-        this.rateLimitInfo = {
-          requestTimestamps: [],
-          lastRequestTime: storedAny.lastRequestTime || 0,
-          isLimited: storedAny.isLimited || false,
-          retryAfter: storedAny.retryAfter,
-        };
-      } else {
-        // New format
-        this.rateLimitInfo = {
-          requestTimestamps: storedAny.requestTimestamps || [],
-          lastRequestTime: storedAny.lastRequestTime || 0,
-          isLimited: storedAny.isLimited || false,
-          retryAfter: storedAny.retryAfter,
-        };
-      }
-      // Clean old timestamps after loading
-      this.cleanOldTimestamps();
+    if (!stored) return;
+
+    const storedAny = stored as unknown as Record<string, unknown>;
+    const requestTimestamps = Array.isArray(storedAny.requestTimestamps)
+      ? (storedAny.requestTimestamps as number[])
+      : []; // old fixed-window format: start from an empty sliding window
+
+    this.rateLimitInfo = {
+      requestTimestamps,
+      lastRequestTime:
+        typeof storedAny.lastRequestTime === "number"
+          ? storedAny.lastRequestTime
+          : 0,
+      isLimited: storedAny.isLimited === true,
+      retryAfter:
+        typeof storedAny.retryAfter === "number"
+          ? storedAny.retryAfter
+          : undefined,
+    };
+
+    // Drop an expired penalty so a stale flag cannot stall the server forever.
+    if (
+      this.rateLimitInfo.isLimited &&
+      this.rateLimitInfo.retryAfter !== undefined &&
+      this.rateLimitInfo.retryAfter <= Date.now()
+    ) {
+      this.rateLimitInfo.isLimited = false;
+      this.rateLimitInfo.retryAfter = undefined;
     }
+
+    this.cleanOldTimestamps();
   }
 
-  /**
-   * Save rate limit data to shared store
-   */
   private saveRateLimitToStore(): void {
     this.cleanOldTimestamps();
     this.rateLimitStore.write({
@@ -127,12 +200,9 @@ export class DuckAI {
       lastRequestTime: this.rateLimitInfo.lastRequestTime,
       isLimited: this.rateLimitInfo.isLimited,
       retryAfter: this.rateLimitInfo.retryAfter,
-    } as any);
+    });
   }
 
-  /**
-   * Get current rate limit status
-   */
   getRateLimitStatus(): {
     requestsInCurrentWindow: number;
     maxRequestsPerMinute: number;
@@ -140,132 +210,281 @@ export class DuckAI {
     isCurrentlyLimited: boolean;
     recommendedWaitTime: number;
   } {
-    // Load latest data from store first
     this.loadRateLimitFromStore();
 
     const now = Date.now();
     const currentRequestCount = this.getCurrentRequestCount();
-
-    // For sliding window, there's no fixed reset time
-    // The "reset" happens continuously as old requests fall out of the window
     const oldestTimestamp = this.rateLimitInfo.requestTimestamps[0];
     const timeUntilReset = oldestTimestamp
-      ? Math.max(0, oldestTimestamp + this.WINDOW_SIZE_MS - now)
+      ? Math.max(0, oldestTimestamp + config.windowSizeMs - now)
       : 0;
-
     const timeSinceLastRequest = now - this.rateLimitInfo.lastRequestTime;
     const recommendedWait = Math.max(
       0,
-      this.MIN_REQUEST_INTERVAL_MS - timeSinceLastRequest,
+      config.minRequestIntervalMs - timeSinceLastRequest,
     );
 
     return {
       requestsInCurrentWindow: currentRequestCount,
-      maxRequestsPerMinute: this.MAX_REQUESTS_PER_MINUTE,
+      maxRequestsPerMinute: config.maxRequestsPerMinute,
       timeUntilWindowReset: timeUntilReset,
       isCurrentlyLimited: this.rateLimitInfo.isLimited,
       recommendedWaitTime: recommendedWait,
     };
   }
 
-  /**
-   * Check if we should wait before making a request
-   */
   private shouldWaitBeforeRequest(): { shouldWait: boolean; waitTime: number } {
-    // Load latest data from store first
     this.loadRateLimitFromStore();
-
     const now = Date.now();
-    const currentRequestCount = this.getCurrentRequestCount();
 
-    // Check if we're hitting the rate limit
-    if (currentRequestCount >= this.MAX_REQUESTS_PER_MINUTE) {
-      // Find the oldest request timestamp
+    // Honor a penalty recorded from an upstream 429.
+    if (this.rateLimitInfo.isLimited && this.rateLimitInfo.retryAfter) {
+      const waitTime = this.rateLimitInfo.retryAfter - now;
+      if (waitTime > 0) return { shouldWait: true, waitTime };
+    }
+
+    if (this.getCurrentRequestCount() >= config.maxRequestsPerMinute) {
       const oldestTimestamp = this.rateLimitInfo.requestTimestamps[0];
       if (oldestTimestamp) {
-        // Wait until the oldest request falls out of the window
-        const waitTime = oldestTimestamp + this.WINDOW_SIZE_MS - now + 100; // +100ms buffer
+        const waitTime = oldestTimestamp + config.windowSizeMs - now + 100;
         return { shouldWait: true, waitTime: Math.max(0, waitTime) };
       }
     }
 
-    // Check minimum interval between requests
     const timeSinceLastRequest = now - this.rateLimitInfo.lastRequestTime;
-    if (timeSinceLastRequest < this.MIN_REQUEST_INTERVAL_MS) {
-      const waitTime = this.MIN_REQUEST_INTERVAL_MS - timeSinceLastRequest;
-      return { shouldWait: true, waitTime };
+    if (timeSinceLastRequest < config.minRequestIntervalMs) {
+      return {
+        shouldWait: true,
+        waitTime: config.minRequestIntervalMs - timeSinceLastRequest,
+      };
     }
 
     return { shouldWait: false, waitTime: 0 };
   }
 
-  /**
-   * Wait if necessary before making a request
-   */
   private async waitIfNeeded(): Promise<void> {
     const { shouldWait, waitTime } = this.shouldWaitBeforeRequest();
-
-    if (shouldWait) {
-      console.log(`Rate limiting: waiting ${waitTime}ms before next request`);
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
-    }
+    if (!shouldWait) return;
+    console.log(`Rate limiting: waiting ${waitTime}ms before next request`);
+    await sleep(waitTime);
   }
 
-  private async getEncodedVqdHash(vqdHash: string): Promise<string> {
-    const jsScript = Buffer.from(vqdHash, "base64").toString("utf-8");
-
-    const dom = new JSDOM(
-      `<iframe id="jsa" sandbox="allow-scripts allow-same-origin" srcdoc="<!DOCTYPE html>
-<html>
-<head>
-<meta http-equiv="Content-Security-Policy"; content="default-src 'none'; script-src 'unsafe-inline'">
-</head>
-<body></body>
-</html>" style="position: absolute; left: -9999px; top: -9999px;"></iframe>`,
-      { runScripts: "dangerously" },
-    );
-    dom.window.top.__DDG_BE_VERSION__ = 1;
-    dom.window.top.__DDG_FE_CHAT_HASH__ = 1;
-    const jsa = dom.window.top.document.querySelector(
-      "#jsa",
-    ) as HTMLIFrameElement;
-    const contentDoc = jsa.contentDocument || jsa.contentWindow!.document;
-
-    const meta = contentDoc.createElement("meta");
-    meta.setAttribute("http-equiv", "Content-Security-Policy");
-    meta.setAttribute(
-      "content",
-      "default-src 'none'; script-src 'unsafe-inline';",
-    );
-    contentDoc.head.appendChild(meta);
-    const result = (await dom.window.eval(jsScript)) as {
-      client_hashes: string[];
-      [key: string]: any;
-    };
-
-    result.client_hashes[0] = this.userAgent;
-    result.client_hashes = result.client_hashes.map((t) => {
-      const hash = createHash("sha256");
-      hash.update(t);
-
-      return hash.digest("base64");
+  /**
+   * Waits for a free slot and records the request atomically. Without the lock
+   * two concurrent requests would both read "0 requests in window" and then
+   * overwrite each other's timestamp in the shared store.
+   */
+  private async acquireRateLimitSlot(): Promise<void> {
+    const previous = this.slotLock;
+    let release!: () => void;
+    this.slotLock = new Promise<void>((resolve) => {
+      release = resolve;
     });
 
-    // duck.ai validates these meta fields; JSDOM can't produce them on its own
-    if (result.meta && typeof result.meta === "object") {
-      (result.meta as any).origin = "https://duck.ai";
-      (result.meta as any).stack = this.vqdStack;
-      (result.meta as any).duration = String(20 + Math.floor(Math.random() * 30));
+    await previous;
+    try {
+      await this.waitIfNeeded();
+      const now = Date.now();
+      this.rateLimitInfo.requestTimestamps.push(now);
+      this.rateLimitInfo.lastRequestTime = now;
+      this.saveRateLimitToStore();
+      this.rateLimitMonitor.printCompactStatus();
+    } finally {
+      release();
     }
-
-    return btoa(JSON.stringify(result));
   }
 
-  private async getVQD(userAgent: string): Promise<VQDResponse> {
-    const response = await fetch("https://duck.ai/duckchat/v1/status", {
+  private noteRateLimited(retryAfterHeader: string | null): number {
+    const seconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : NaN;
+    const waitMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 60_000;
+    this.rateLimitInfo.isLimited = true;
+    this.rateLimitInfo.retryAfter = Date.now() + waitMs;
+    this.saveRateLimitToStore();
+    return waitMs;
+  }
+
+  // ------------------------------------------------------- frontend discovery
+
+  private invalidateDiscovery(): void {
+    this.discovery = null;
+  }
+
+  private async getFrontendInfo(): Promise<FrontendInfo> {
+    const cached = this.discovery;
+    if (cached && Date.now() - cached.fetchedAt < config.discoveryTtlMs) {
+      return cached;
+    }
+    if (this.discoveryInFlight) return this.discoveryInFlight;
+
+    const task = this.fetchFrontendInfo();
+    this.discoveryInFlight = task.finally(() => {
+      this.discoveryInFlight = null;
+    });
+    this.discovery = await this.discoveryInFlight;
+    return this.discovery;
+  }
+
+  /**
+   * Reads the current `data-version-*` attributes and the duckai bundle URL from
+   * duck.ai. Falls back to the env override / built-in values so a markup change
+   * degrades instead of breaking every request.
+   */
+  private async fetchFrontendInfo(): Promise<FrontendInfo> {
+    const fallback = (): FrontendInfo => ({
+      version: "",
+      sha: "",
+      stack: process.env.X_VQD_STACK || "",
+      fetchedAt: Date.now(),
+    });
+
+    try {
+      const response = await fetch(`${DUCKAI_ORIGIN}/`, {
+        headers: {
+          accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": config.acceptLanguage,
+          "user-agent": config.userAgent,
+        },
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      }
+
+      const html = await response.text();
+      const dom = new JSDOM(html);
+      const root = dom.window.document.documentElement;
+      const version = root.getAttribute("data-version-tag") || "";
+      const sha = root.getAttribute("data-version-sha") || "";
+      const scriptSrc = Array.from(
+        dom.window.document.querySelectorAll("script[src]"),
+      )
+        .map((element) => element.getAttribute("src") || "")
+        .find((src) =>
+          /\/dist\/duckai-dist\/entry\.duckai\.[a-zA-Z0-9]+\.js/.test(src),
+        );
+      const stack = scriptSrc
+        ? new URL(scriptSrc, DUCKAI_ORIGIN).toString()
+        : "";
+      dom.window.close();
+
+      const info: FrontendInfo = {
+        version,
+        sha,
+        stack,
+        fetchedAt: Date.now(),
+      };
+      if (!version || !sha) {
+        console.warn(
+          "duck.ai frontend version could not be detected; falling back to configured values",
+        );
+      }
+      return info;
+    } catch (error) {
+      console.warn(
+        `Failed to discover the duck.ai frontend version: ${(error as Error).message}`,
+      );
+      return fallback();
+    }
+  }
+
+  private xFeVersion(frontend: FrontendInfo): string {
+    if (process.env.X_FE_VERSION) return process.env.X_FE_VERSION;
+    if (frontend.version && frontend.sha) {
+      return `${frontend.version}-${frontend.sha}`;
+    }
+    return "";
+  }
+
+  /** `meta.stack` as the web client reports it (`new Error().stack`). */
+  private stackFor(frontend: FrontendInfo): string {
+    if (process.env.X_VQD_STACK) return process.env.X_VQD_STACK;
+    const url = frontend.stack || DEFAULT_STACK_URL;
+    return `Error\n    at ${url}:2:1308110`;
+  }
+
+  /** `x-fe-signals` payload: base64 of the fraud-signal envelope. */
+  private feSignals(): string {
+    return btoa(JSON.stringify({ start: Date.now(), events: [], end: 0 }));
+  }
+
+  // --------------------------------------------------------------------- VQD
+
+  /**
+   * Runs the obfuscated challenge returned by `/duckchat/v1/status` inside a
+   * throwaway document and returns the encoded `x-vqd-hash-1` value.
+   */
+  private async encodeVqdHash(
+    vqdHash: string,
+    userAgent: string,
+    frontend: FrontendInfo,
+  ): Promise<VQDResponse> {
+    const startedAt = Date.now();
+    const script = atob(vqdHash);
+
+    const dom = new JSDOM(CHALLENGE_DOCUMENT, {
+      url: `${DUCKAI_ORIGIN}/`,
+      runScripts: "outside-only",
+      pretendToBeVisual: true,
+    });
+
+    try {
+      const scope = dom.window as unknown as Record<string, unknown>;
+      scope.__DDG_BE_VERSION__ = frontend.version || "dev";
+      scope.__DDG_FE_CHAT_HASH__ = frontend.sha || "hash";
+
+      const result = (await dom.window.eval(script)) as {
+        client_hashes?: unknown;
+        meta?: unknown;
+        [key: string]: unknown;
+      };
+
+      if (
+        !result || typeof result !== "object" ||
+        !Array.isArray(result.client_hashes)
+      ) {
+        throw new UpstreamError(
+          `Unexpected VQD challenge payload: ${truncate(JSON.stringify(result))}`,
+          502,
+        );
+      }
+
+      // The challenge hashes the real navigator.userAgent; we replace it with
+      // the UA we actually send so the fingerprint stays consistent.
+      result.client_hashes[0] = userAgent;
+      result.client_hashes = (result.client_hashes as unknown[]).map((value) =>
+        createHash("sha256").update(String(value)).digest("base64"),
+      );
+
+      const meta =
+        result.meta && typeof result.meta === "object"
+          ? (result.meta as Record<string, unknown>)
+          : {};
+      const duration = Math.max(1, Math.min(250, Date.now() - startedAt));
+      result.meta = {
+        ...meta,
+        origin: DUCKAI_ORIGIN,
+        stack: this.stackFor(frontend),
+        duration: String(duration),
+      };
+
+      return {
+        hash: btoa(JSON.stringify(result)),
+        version: this.xFeVersion(frontend),
+      };
+    } finally {
+      dom.window.close();
+    }
+  }
+
+  /** Low-level: fetches a fresh challenge. Exposed for diagnostics/tests. */
+  async getVQD(userAgent: string = config.userAgent): Promise<VQDResponse> {
+    const frontend = await this.getFrontendInfo();
+
+    const response = await fetch(DUCKAI_STATUS_URL, {
       headers: {
         accept: "*/*",
-        "accept-language": "en-US,en;q=0.9,fa;q=0.8",
+        "accept-language": config.acceptLanguage,
         "cache-control": "no-store",
         pragma: "no-cache",
         priority: "u=1, i",
@@ -273,290 +492,382 @@ export class DuckAI {
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "x-vqd-accept": "1",
-        "User-Agent": userAgent,
+        "x-ddg-journey-id": JOURNEY_ID,
+        "user-agent": userAgent,
+        referer: `${DUCKAI_ORIGIN}/`,
       },
-      referrer: "https://duck.ai/",
-      referrerPolicy: "origin",
       method: "GET",
-      mode: "cors",
-      credentials: "include",
+      signal: AbortSignal.timeout(config.requestTimeoutMs),
     });
 
     if (!response.ok) {
-      throw new Error(
-        `Failed to get VQD: ${response.status} ${response.statusText}`,
+      throw new UpstreamError(
+        `VQD status request failed: ${response.status} ${response.statusText}`,
+        response.status,
       );
     }
 
-    const hashHeader = response.headers.get("x-Vqd-hash-1");
-
+    const hashHeader = response.headers.get("x-vqd-hash-1");
     if (!hashHeader) {
-      throw new Error(`Missing VQD headers: hash=${!!hashHeader}`);
+      throw new UpstreamError(
+        "VQD status response is missing the x-vqd-hash-1 header",
+        502,
+      );
     }
 
-    const encodedHash = await this.getEncodedVqdHash(hashHeader);
-
-    return { hash: encodedHash };
+    return this.encodeVqdHash(hashHeader, userAgent, frontend);
   }
 
-  private async hashClientHashes(clientHashes: string[]): Promise<string[]> {
-    return Promise.all(
-      clientHashes.map(async (hash) => {
-        const encoder = new TextEncoder();
-        const data = encoder.encode(hash);
-        const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-        const hashArray = new Uint8Array(hashBuffer);
-        return btoa(
-          hashArray.reduce((str, byte) => str + String.fromCharCode(byte), ""),
-        );
-      }),
-    );
-  }
-
-  private async fetchDuckAIEndpoint(
+  /** Sends one chat request. Public so diagnostics scripts can reuse it. */
+  async sendChatRequest(
     request: DuckAIRequest,
     userAgent: string,
     vqd: VQDResponse,
+    timeoutMs: number = config.requestTimeoutMs,
   ): Promise<Response> {
-    return await fetch("https://duck.ai/duckchat/v1/chat", {
-      headers: {
-        accept: "text/event-stream",
-        "accept-language": "en-US,en;q=0.9",
-        "cache-control": "no-cache",
-        "content-type": "application/json",
-        pragma: "no-cache",
-        priority: "u=0",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "x-fe-signals": process.env.X_FE_SIGNALS,
-        "x-fe-version": process.env.X_FE_VERSION,
-        "User-Agent": userAgent,
-        "x-vqd-hash-1": vqd.hash,
-      },
-      referrer: "https://duck.ai/",
-      referrerPolicy: "origin",
-      body: JSON.stringify(request),
+    const headers: Record<string, string> = {
+      accept: "text/event-stream",
+      "accept-language": config.acceptLanguage,
+      "cache-control": "no-cache",
+      "content-type": "application/json",
+      pragma: "no-cache",
+      priority: "u=0",
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+      origin: DUCKAI_ORIGIN,
+      referer: `${DUCKAI_ORIGIN}/`,
+      "user-agent": userAgent,
+      "x-ddg-journey-id": JOURNEY_ID,
+      "x-fe-signals": this.feSignals(),
+      "x-vqd-hash-1": vqd.hash,
+    };
+    if (vqd.version) headers["x-fe-version"] = vqd.version;
+    // Only forward model ids that cannot become a header-injection vector.
+    if (/^[A-Za-z0-9._:\/-]+$/.test(request.model)) {
+      headers["x-duckai-chat-model"] = request.model;
+    }
+
+    return fetch(DUCKAI_CHAT_URL, {
       method: "POST",
-      mode: "cors",
-      credentials: "include",
+      headers,
+      body: JSON.stringify(request),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   }
 
-  // retry in increasing intervals when 418 error code
-  private async safeFetchDuckAIEndpoint(
-    request: DuckAIRequest,
-    userAgent: string,
-    vqd: VQDResponse,
-    attempt?: number,
-  ): Promise<Response> {
-    const response: Response = await this.fetchDuckAIEndpoint(
-      request,
-      userAgent,
-      vqd,
-    );
-    var currentAttempt = attempt || 0;
-    if (response.status == 418 && currentAttempt < 5) {
-      const waitTime = currentAttempt + 1;
-      console.warn(`⚠️ Encountered error 418, waiting for ${waitTime} seconds before refetching. Attempt: ${currentAttempt + 1}`)
-      return await sleep(waitTime * 1000).then(() => this.safeFetchDuckAIEndpoint(request, userAgent, vqd, currentAttempt + 1))
-    }
-    return response;
+  private retryDelay(attempt: number): number {
+    const exponential = config.retryBaseDelayMs * 2 ** (attempt - 1);
+    const capped = Math.min(config.retryMaxDelayMs, exponential);
+    // Jitter keeps parallel clients from retrying in lockstep.
+    return Math.round(capped * (0.5 + Math.random() * 0.5));
   }
 
-  async chat(
+  /**
+   * Performs the VQD + chat round trip, retrying retryable upstream failures.
+   * Every attempt gets a *fresh* VQD challenge: reusing the one that was just
+   * rejected with a 418 is what made the previous retry loop pointless.
+   */
+  private async requestChatSession(
     request: DuckAIRequest,
-    attempt?: number,
-  ): Promise<DuckAIChatResult> {
-    // Wait if rate limiting is needed
-    await this.waitIfNeeded();
+    options: { timeoutMs: number; attempts: number },
+  ): Promise<Response> {
+    const attempts = Math.max(1, options.attempts);
+    let lastError: Error | null = null;
+    // Extra wait added to the next retry after a rejected challenge.
+    let penaltyMs = 0;
 
-    const userAgent = this.userAgent;
-    const vqd = await this.getVQD(userAgent);
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await sleep(this.retryDelay(attempt) + penaltyMs);
+      await this.acquireRateLimitSlot();
 
-    // Update rate limit tracking BEFORE making the request
-    const now = Date.now();
-    this.rateLimitInfo.requestTimestamps.push(now);
-    this.rateLimitInfo.lastRequestTime = now;
-    this.saveRateLimitToStore();
-
-    // Show compact rate limit status in server console
-    this.rateLimitMonitor.printCompactStatus();
-
-    // const response = await this.fetchDuckAIEndpoint(request, userAgent, vqd);
-    const response = await this.safeFetchDuckAIEndpoint(request, userAgent, vqd);
-
-    // Handle rate limiting
-    if (response.status === 429) {
-      const retryAfter = response.headers.get("retry-after");
-      const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000; // Default 1 minute
-      throw new Error(
-        `Rate limited. Retry after ${waitTime}ms. Status: ${response.status}`,
-      );
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        `DuckAI API error: ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const text = await response.text();
-
-    // Check for errors
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed.action === "error") {
-        throw new Error(`Duck.ai error: ${JSON.stringify(parsed)}`);
+      const userAgent = config.userAgent;
+      let vqd: VQDResponse;
+      try {
+        vqd = await this.getVQD(userAgent);
+      } catch (error) {
+        lastError = error as Error;
+        const status =
+          error instanceof UpstreamError ? error.upstreamStatus : 0;
+        if (!isRetryableStatus(status)) throw error;
+        continue;
       }
-    } catch (e) {
-      // Not JSON, continue processing
+
+      let response: Response;
+      try {
+        response = await this.sendChatRequest(
+          request,
+          userAgent,
+          vqd,
+          options.timeoutMs,
+        );
+      } catch (error) {
+        // Network error / timeout: retryable.
+        lastError = error as Error;
+        continue;
+      }
+
+      if (response.ok) return response;
+
+      const body = await response.text().catch(() => "");
+      const payload = parseUpstreamErrorPayload(body);
+      lastError = new UpstreamError(
+        payload?.message ??
+          `duck.ai returned ${response.status} ${response.statusText}: ${truncate(body)}`,
+        payload?.status ?? response.status,
+      );
+
+      if (response.status === 418) {
+        // The frontend bundle almost certainly moved; re-discover next attempt.
+        this.invalidateDiscovery();
+        // Rejected challenges arrive in bursts rather than one at a time, so
+        // wait longer than a plain network retry before solving the next one.
+        penaltyMs = 1_500 * 2 ** attempt;
+      }
+
+      if (response.status === 429) {
+        const waitMs = this.noteRateLimited(
+          response.headers.get("retry-after"),
+        );
+        if (waitMs > 30_000 || attempt === attempts - 1) {
+          throw new RateLimitError(
+            `duck.ai rate limit hit; retry after ${Math.ceil(waitMs / 1000)}s`,
+            waitMs,
+          );
+        }
+        continue;
+      }
+
+      if (!isRetryableStatus(response.status)) throw lastError;
     }
 
-    // Extract content and reasoning from the streamed response
+    throw lastError ??
+      new UpstreamError("duck.ai request failed after all retries", 502);
+  }
+
+  // ------------------------------------------------------------------- chat
+
+  /** Parses the SSE-ish body of a non-streaming completion. */
+  private parseChatResponse(text: string): DuckAIChatResult {
+    const payloadError = parseUpstreamErrorPayload(text);
+    if (payloadError) {
+      throw new UpstreamError(payloadError.message, payloadError.status ?? 502);
+    }
+
     let content = "";
     let reasoning = "";
-    const lines = text.split("\n");
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      const payload = line.slice(6);
-      if (payload === "[DONE]") continue;
+
+    for (const rawLine of text.replace(/\r/g, "").split("\n")) {
+      if (!rawLine.startsWith("data: ")) continue;
+      const payload = rawLine.slice(6).trim();
+      if (!payload || payload === "[DONE]") continue;
+
+      let json: Record<string, unknown>;
       try {
-        const json = JSON.parse(payload);
-        if (json.role === "reasoning" && typeof json.text === "string") {
-          reasoning += json.text;
-        } else if (typeof json.message === "string") {
-          content += json.message;
-        }
-      } catch (e) {
-        // Skip invalid JSON lines (incl. [CHAT_TITLE:...] and [PING] sentinels)
+        json = JSON.parse(payload) as Record<string, unknown>;
+      } catch {
+        // [PING] / [CHAT_TITLE:...] sentinels and partial lines
+        continue;
+      }
+      if (!json || typeof json !== "object") continue;
+
+      if (json.action === "error") {
+        throw new UpstreamError(
+          `duck.ai error: ${truncate(payload)}`,
+          typeof json.status === "number" ? json.status : 502,
+        );
+      }
+      if (json.role === "reasoning" && typeof json.text === "string") {
+        reasoning += json.text;
+      } else if (typeof json.message === "string") {
+        content += json.message;
       }
     }
 
-    const finalContent = content.trim();
+    const result: DuckAIChatResult = { content: content.trim() };
+    if (config.emitReasoning && reasoning) result.reasoning = reasoning;
+    return result;
+  }
 
-    // If content is empty, retry up to 5 times then fall back
-    var currentAttempt = attempt || 0;
-    if (!finalContent && currentAttempt <= 5) {
-      console.warn("Duck.ai returned empty response, retrying call");
-      return this.chat(request, currentAttempt + 1);
-    } else if (currentAttempt > 5) {
-      return {
-        content:
-          "I apologize, but I'm unable to provide a response at the moment. Please try again.",
-      };
+  async chat(request: DuckAIRequest): Promise<DuckAIChatResult> {
+    const attempts = config.maxAttempts;
+    let lastError: Error | null = null;
+    let result: DuckAIChatResult = { content: "" };
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await sleep(this.retryDelay(attempt));
+
+      try {
+        const response = await this.requestChatSession(request, {
+          timeoutMs: config.requestTimeoutMs,
+          // The retry budget lives in this loop, so each session attempt is a
+          // single round trip (with a freshly fetched VQD challenge).
+          attempts: 1,
+        });
+        result = this.parseChatResponse(await response.text());
+      } catch (error) {
+        lastError = error as Error;
+        if (error instanceof RateLimitError) throw error;
+        const retryable =
+          error instanceof UpstreamError
+            ? isRetryableStatus(error.upstreamStatus)
+            : true;
+        if (!retryable) throw error;
+        console.warn(
+          `duck.ai request failed (attempt ${attempt + 1}/${attempts}): ${(error as Error).message}`,
+        );
+        continue;
+      }
+
+      if (result.content) return result;
+      console.warn(
+        `duck.ai returned an empty completion (attempt ${attempt + 1}/${attempts})`,
+      );
     }
 
-    const result: DuckAIChatResult = { content: finalContent };
-    if (this.emitReasoning && reasoning) result.reasoning = reasoning;
-    return result;
+    if (result.content) return result;
+    if (lastError) throw lastError;
+    return { content: EMPTY_RESPONSE_FALLBACK };
   }
 
   async chatStream(
     request: DuckAIRequest,
   ): Promise<ReadableStream<DuckAIStreamChunk>> {
-    // Wait if rate limiting is needed
-    await this.waitIfNeeded();
-
-    const userAgent = this.userAgent;
-    const vqd = await this.getVQD(userAgent);
-
-    // Update rate limit tracking BEFORE making the request
-    const now = Date.now();
-    this.rateLimitInfo.requestTimestamps.push(now);
-    this.rateLimitInfo.lastRequestTime = now;
-    this.saveRateLimitToStore();
-
-    // Show compact rate limit status in server console
-    this.rateLimitMonitor.printCompactStatus();
-
-    // const response = await this.fetchDuckAIEndpoint(request, userAgent, vqd);
-    const response = await this.safeFetchDuckAIEndpoint(request, userAgent, vqd);
-
-    // Handle rate limiting
-    if (response.status === 429) {
-      const retryAfter = response.headers.get("retry-after");
-      const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000; // Default 1 minute
-      throw new Error(
-        `Rate limited. Retry after ${waitTime}ms. Status: ${response.status}`,
-      );
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        `DuckAI API error: ${response.status} ${response.statusText}`,
-      );
-    }
+    const response = await this.requestChatSession(request, {
+      timeoutMs: config.streamTimeoutMs,
+      attempts: config.maxAttempts,
+    });
 
     if (!response.body) {
-      throw new Error("No response body");
+      throw new UpstreamError("duck.ai returned an empty response body", 502);
     }
 
-    const emitReasoning = this.emitReasoning;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const emitReasoning = config.emitReasoning;
+    let buffer = "";
 
-    return new ReadableStream({
-      start(controller) {
-        const reader = response.body!.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
+    const emitLine = (
+      controller: ReadableStreamDefaultController<DuckAIStreamChunk>,
+      line: string,
+    ): boolean => {
+      if (!line.startsWith("data: ")) return false;
+      const payload = line.slice(6).trim();
+      if (!payload || payload === "[DONE]") return false;
 
-        function handleLine(line: string) {
-          if (!line.startsWith("data: ")) return;
-          const payload = line.slice(6);
-          if (payload === "[DONE]") return;
-          try {
-            const json = JSON.parse(payload);
-            if (
-              emitReasoning &&
-              json.role === "reasoning" &&
-              typeof json.text === "string" &&
-              json.text.length > 0
-            ) {
-              controller.enqueue({ type: "reasoning", text: json.text });
-            } else if (typeof json.message === "string") {
-              controller.enqueue({ type: "content", text: json.message });
-            }
-          } catch (e) {
-            // Skip invalid JSON (incl. [CHAT_TITLE:...] / [PING] sentinels)
-          }
-        }
+      let json: Record<string, unknown>;
+      try {
+        json = JSON.parse(payload) as Record<string, unknown>;
+      } catch {
+        return false; // [PING] / [CHAT_TITLE:...] sentinels
+      }
+      if (!json || typeof json !== "object") return false;
 
-        function pump(): Promise<void> {
-          return reader.read().then(({ done, value }) => {
+      if (json.action === "error") {
+        throw new UpstreamError(
+          `duck.ai error: ${truncate(payload)}`,
+          typeof json.status === "number" ? json.status : 502,
+        );
+      }
+      if (
+        emitReasoning && json.role === "reasoning" &&
+        typeof json.text === "string" && json.text.length > 0
+      ) {
+        controller.enqueue({ type: "reasoning", text: json.text });
+        return true;
+      }
+      if (typeof json.message === "string" && json.message.length > 0) {
+        controller.enqueue({ type: "content", text: json.message });
+        return true;
+      }
+      return false;
+    };
+
+    return new ReadableStream<DuckAIStreamChunk>({
+      async pull(controller) {
+        for (;;) {
+          const newlineIndex = buffer.indexOf("\n");
+          if (newlineIndex < 0) {
+            const { done, value } = await reader.read();
             if (done) {
-              if (buf.length > 0) handleLine(buf);
+              if (buffer.length > 0) emitLine(controller, buffer);
+              buffer = "";
               controller.close();
               return;
             }
+            buffer += decoder.decode(value, { stream: true });
+            continue;
+          }
 
-            buf += decoder.decode(value, { stream: true });
-            let idx;
-            while ((idx = buf.indexOf("\n")) >= 0) {
-              handleLine(buf.slice(0, idx));
-              buf = buf.slice(idx + 1);
-            }
-
-            return pump();
-          });
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          if (emitLine(controller, line)) return;
         }
-
-        return pump();
+      },
+      cancel(reason) {
+        // Client went away: stop pulling from duck.ai instead of leaking it.
+        reader.cancel(reason).catch(() => {});
       },
     });
+  }
+
+  /** Snapshot of the fingerprint this process would send. */
+  async describeEnvironment(): Promise<{
+    userAgent: string;
+    feVersion: string;
+    stack: string;
+    durableStream: boolean;
+  }> {
+    const frontend = await this.getFrontendInfo();
+    return {
+      userAgent: config.userAgent,
+      feVersion: this.xFeVersion(frontend),
+      stack: this.stackFor(frontend),
+      durableStream: config.streamKey.length > 0,
+    };
   }
 
   getAvailableModels(): string[] {
     return Object.keys(DUCKAI_MODELS);
   }
 
+  // -------------------------------------------------------------- conversion
+
+  private static buildDurableStream(): DuckAIRequest["durableStream"] {
+    const raw = config.streamKey;
+    if (!raw) return undefined;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new ValidationError(
+        "STREAM_KEY is not valid JSON (expected the duckaiStreamsTestCredentials value)",
+      );
+    }
+
+    const publicKey =
+      parsed && typeof parsed === "object" && "publicKey" in parsed
+        ? (parsed as { publicKey?: unknown }).publicKey
+        : parsed;
+    if (!publicKey || typeof publicKey !== "object") {
+      throw new ValidationError("STREAM_KEY does not contain a publicKey object");
+    }
+
+    return {
+      conversationId: randomUUID(),
+      messageId: randomUUID(),
+      publicKey,
+    };
+  }
+
   static transformToDuckAIRequest(
     request: ChatCompletionRequest,
   ): DuckAIRequest {
-    // Use the model from request, fallback to default
     const model = request.model || "gpt-6-luna";
 
     if (!(model in DUCKAI_MODELS)) {
-      throw new Error(
+      throw new ValidationError(
         `Model ${model} is not a valid model, valid models: ${Object.keys(DUCKAI_MODELS).join(", ")}`,
       );
     }
@@ -564,74 +875,58 @@ export class DuckAI {
     const transformedMessages: DuckChatCompletionMessage[] = [];
 
     for (const message of request.messages as ChatCompletionMessage[]) {
-      if (Array.isArray(message.content)) {
-        const transformedContent = [];
-        for (const content of message.content as ChatCompletionContentPart[]) {
-          if (content.type == "text") {
-            if (typeof content.text !== "string" || content.type !== "text") {
-              throw new Error("Image text must be a string of type text");
-            }
-
-            transformedContent.push(content);
-          } else if (content.type == "image_url") {
-            if (
-              content.image_url === null ||
-              typeof content.image_url?.url !== "string" ||
-              content.type !== "image_url"
-            ) {
-              throw new Error("Image payload is incorrect");
-            }
-
-            // valid image, transform to DuckChatCompletionRequest
-            // data:image/png;base64,fah
-            console.log(content.image_url);
-            const newImagePayload: DuckChatCompletionContentPartImage = {
-              image: content.image_url.url,
-              type: "image",
-              mimeType: content.image_url.url.split(":")[1].split(";")[0],
-            };
-            //console.log(newImagePayload);
-            transformedContent.push(newImagePayload);
-          } else if (content.type == "file") {
-            if (
-              content.file === null ||
-              typeof content.file.file_data != "string" ||
-              typeof content.file.filename != "string"
-            ) {
-              throw new Error("File payload is incorrect or missing");
-            }
-
-            // valid file, transform to DuckChatCompletionContentPartFile
-            const newFilePayload: DuckChatCompletionContentPartFile = {
-              content: content.file.file_data.split(",")[1],
-              encoding: content.file.file_data?.split(";")[1].split(",")[0],
-              filename: content.file.filename,
-              mimeType: content.file.file_data?.split(":")[1].split(";")[0],
-              type: "file",
-            };
-            //console.log(newFilePayload);
-            transformedContent.push(newFilePayload);
-          }
-        }
-
-        // transform message
-        const clonedMessage = structuredClone(message);
-        const newMessage = {
-          ...clonedMessage,
-          content: transformedContent,
-        };
-        transformedMessages.push(newMessage as DuckChatCompletionMessage);
-      } else {
+      if (!Array.isArray(message.content)) {
         transformedMessages.push(message as DuckChatCompletionMessage);
+        continue;
       }
+
+      const transformedContent: DuckChatCompletionContentPart[] = [];
+      for (const content of message.content as ChatCompletionContentPart[]) {
+        if (content.type === "text") {
+          if (typeof content.text !== "string") {
+            throw new ValidationError("Text content must be a string");
+          }
+          transformedContent.push({ type: "text", text: content.text });
+        } else if (content.type === "image_url") {
+          const url = content.image_url?.url;
+          if (typeof url !== "string" || url.length === 0) {
+            throw new ValidationError("Image payload is incorrect");
+          }
+          const image: DuckChatCompletionContentPartImage = {
+            image: url,
+            type: "image",
+            mimeType: parseDataUrl(url).mimeType,
+          };
+          transformedContent.push(image);
+        } else if (content.type === "file") {
+          const fileData = content.file?.file_data;
+          const filename = content.file?.filename;
+          if (typeof fileData !== "string" || typeof filename !== "string") {
+            throw new ValidationError("File payload is incorrect or missing");
+          }
+          const parsedFile = parseDataUrl(fileData);
+          const file: DuckChatCompletionContentPartFile = {
+            content: parsedFile.data,
+            encoding: parsedFile.encoding,
+            filename,
+            mimeType: parsedFile.mimeType,
+            type: "file",
+          };
+          transformedContent.push(file);
+        }
+      }
+
+      transformedMessages.push({
+        ...structuredClone(message),
+        content: transformedContent,
+      } as DuckChatCompletionMessage);
     }
 
-    // validate reasoning effort
     const modelDefaults = DUCKAI_MODELS[model];
     const validReasoningEfforts = modelDefaults.valid_reasoning_efforts;
 
-    // models that do not declare a reasoning effort (e.g. mistral-small-2603)
-    // do not get one, even when the client asks for it
+    // Models that do not declare a reasoning effort (e.g. mistral-small-2603)
+    // do not get one, even when the client asks for it.
     const reasoning_effort =
       validReasoningEfforts !== undefined
         ? request.reasoning_effort || modelDefaults.reasoning_effort
@@ -642,11 +937,12 @@ export class DuckAI {
       reasoning_effort !== undefined &&
       !validReasoningEfforts.includes(reasoning_effort)
     ) {
-      throw new Error(
-        `Model ${model} does not support this reasoning effort (${reasoning_effort}),
-        valid reasoning efforts: ${validReasoningEfforts.join(", ")}`,
+      throw new ValidationError(
+        `Model ${model} does not support this reasoning effort (${reasoning_effort}), valid reasoning efforts: ${validReasoningEfforts.join(", ")}`,
       );
     }
+
+    const durableStream = DuckAI.buildDurableStream();
 
     return {
       canUseTools: true,
@@ -654,6 +950,8 @@ export class DuckAI {
       metadata: request.metadata,
       model,
       reasoningEffort: reasoning_effort,
+      ...(durableStream ? { durableStream } : {}),
     };
   }
 }
+
