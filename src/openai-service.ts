@@ -9,8 +9,9 @@ import type {
   Model,
   ToolCall,
   DuckAIMetadata,
+  DuckAIStreamChunk,
 } from "./types";
-import { ValidationError } from "./errors";
+import { AppError, ValidationError } from "./errors";
 
 export class OpenAIService {
   private duckAI: DuckAI;
@@ -399,7 +400,29 @@ Please follow these instructions when responding to the following user message.`
 
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
-        const { done, value } = await reader.read();
+        let next: ReadableStreamReadResult<DuckAIStreamChunk>;
+        try {
+          next = await reader.read();
+        } catch (error) {
+          // The HTTP status is already 200, so report the failure the way
+          // OpenAI does mid-stream: an `error` event (the SDKs raise it as an
+          // APIError) followed by [DONE], instead of silently cutting off.
+          const appError = error instanceof AppError ? error : null;
+          const payload = {
+            error: {
+              message:
+                error instanceof Error ? error.message : "duck.ai stream failed",
+              type: appError?.type ?? "upstream_error",
+            },
+          };
+          console.warn("duck.ai stream failed:", payload.error.message);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+          return;
+        }
+
+        const { done, value } = next;
         if (done) {
           finish(controller, "stop");
           return;
@@ -643,6 +666,22 @@ Please follow these instructions when responding to the following user message.`
         conversation.push({
           role: "user",
           content: `[tool result for ${message.tool_call_id}]\n${message.content}`,
+        });
+        continue;
+      }
+
+      // The matching assistant turn usually has `content: null` plus
+      // `tool_calls`, neither of which duck.ai understands; spell the calls
+      // out so the model still sees what it asked for.
+      if (message.role === "assistant" && message.tool_calls?.length) {
+        const calls = message.tool_calls.map(
+          (call) =>
+            `[tool call ${call?.id ?? "?"}: ${call?.function?.name ?? "?"}(${call?.function?.arguments ?? ""})]`,
+        );
+        const text = this.contentToText(message.content);
+        conversation.push({
+          role: "assistant",
+          content: [text, ...calls].filter(Boolean).join("\n"),
         });
         continue;
       }

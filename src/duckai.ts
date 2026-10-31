@@ -314,10 +314,6 @@ export class DuckAI {
 
   // ------------------------------------------------------- frontend discovery
 
-  private invalidateDiscovery(): void {
-    this.discovery = null;
-  }
-
   private async getFrontendInfo(): Promise<FrontendInfo> {
     const cached = this.discovery;
     if (cached && Date.now() - cached.fetchedAt < config.discoveryTtlMs) {
@@ -687,12 +683,15 @@ export class DuckAI {
    * Performs the VQD + chat round trip, retrying retryable upstream failures.
    * Every attempt gets a *fresh* VQD challenge: reusing the one that was just
    * rejected with a 418 is what made the previous retry loop pointless.
+   *
+   * This is the only place that retries HTTP-level failures (418/429/5xx,
+   * network errors); an error thrown from here means the budget is spent.
    */
   private async requestChatSession(
     request: DuckAIRequest,
-    options: { timeoutMs: number; attempts: number },
+    timeoutMs: number,
   ): Promise<Response> {
-    const attempts = Math.max(1, options.attempts);
+    const attempts = config.maxAttempts;
     let lastError: Error | null = null;
     // Extra wait added to the next retry after a rejected challenge.
     let penaltyMs = 0;
@@ -719,7 +718,7 @@ export class DuckAI {
           request,
           userAgent,
           vqd,
-          options.timeoutMs,
+          timeoutMs,
         );
       } catch (error) {
         // Network error / timeout: retryable.
@@ -738,10 +737,11 @@ export class DuckAI {
       );
 
       if (response.status === 418) {
-        // The frontend bundle almost certainly moved; re-discover next attempt.
-        this.invalidateDiscovery();
-        // Rejected challenges arrive in bursts rather than one at a time, so
-        // wait longer than a plain network retry before solving the next one.
+        // 418 is intermittent (see "Reliability" in README.md), not a sign of
+        // a new frontend bundle, so the discovery cache stays: re-discovering
+        // would only add three more requests per rejection. Rejected
+        // challenges arrive in bursts, so wait longer than a plain network
+        // retry before solving the next one.
         penaltyMs = 1_500 * 2 ** attempt;
       }
 
@@ -809,32 +809,34 @@ export class DuckAI {
     return result;
   }
 
+  /**
+   * Non-streaming completion. HTTP-level failures are already retried by
+   * `requestChatSession`; this loop only covers what can go wrong *after* a
+   * `200`: an empty completion, an error event inside the body, or the body
+   * read failing halfway.
+   */
   async chat(request: DuckAIRequest): Promise<DuckAIChatResult> {
     const attempts = config.maxAttempts;
-    let lastError: Error | null = null;
-    let result: DuckAIChatResult = { content: "" };
 
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) await sleep(this.retryDelay(attempt));
 
+      const response = await this.requestChatSession(
+        request,
+        config.requestTimeoutMs,
+      );
+
+      let result: DuckAIChatResult;
       try {
-        const response = await this.requestChatSession(request, {
-          timeoutMs: config.requestTimeoutMs,
-          // The retry budget lives in this loop, so each session attempt is a
-          // single round trip (with a freshly fetched VQD challenge).
-          attempts: 1,
-        });
         result = this.parseChatResponse(await response.text());
       } catch (error) {
-        lastError = error as Error;
-        if (error instanceof RateLimitError) throw error;
         const retryable =
           error instanceof UpstreamError
             ? isRetryableStatus(error.upstreamStatus)
             : true;
-        if (!retryable) throw error;
+        if (!retryable || attempt === attempts - 1) throw error;
         console.warn(
-          `duck.ai request failed (attempt ${attempt + 1}/${attempts}): ${(error as Error).message}`,
+          `duck.ai response failed (attempt ${attempt + 1}/${attempts}): ${(error as Error).message}`,
         );
         continue;
       }
@@ -845,18 +847,16 @@ export class DuckAI {
       );
     }
 
-    if (result.content) return result;
-    if (lastError) throw lastError;
     return { content: EMPTY_RESPONSE_FALLBACK };
   }
 
   async chatStream(
     request: DuckAIRequest,
   ): Promise<ReadableStream<DuckAIStreamChunk>> {
-    const response = await this.requestChatSession(request, {
-      timeoutMs: config.streamTimeoutMs,
-      attempts: config.maxAttempts,
-    });
+    const response = await this.requestChatSession(
+      request,
+      config.streamTimeoutMs,
+    );
 
     if (!response.body) {
       throw new UpstreamError("duck.ai returned an empty response body", 502);

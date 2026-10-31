@@ -585,9 +585,9 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 DuckDuckGo's chat API answers with `418 I'm a teapot` (`ERR_CHALLENGE`) whenever the client fingerprint does not add up. Everything the server does about it:
 
 - One consistent fingerprint per process: the same `User-Agent` for the VQD and the chat request, browser-like `Accept`, `Accept-Language`, `Origin`, `Referer`, `Sec-Fetch-*`, `x-ddg-journey-id`, generated `x-fe-signals`, and the browser-only VQD `meta` fields (`origin`, `stack`, `duration`).
-- The frontend version, its SHA and the duckai bundle URL are read from `https://duck.ai/` and cached for `X_DISCOVERY_TTL_MS` (default 10 minutes), so a DuckDuckGo release cannot leave the server with a stale `x-fe-version`. A `418` invalidates that cache.
+- The frontend version, its SHA and the duckai bundle URL are read from `https://duck.ai/` and cached for `X_DISCOVERY_TTL_MS` (default 10 minutes), so a DuckDuckGo release cannot leave the server with a stale `x-fe-version`. A `418` does *not* invalidate that cache: it is intermittent (see below), and re-discovering would add three extra requests per rejection.
 - The VQD challenge is executed in a throwaway JSDOM document, and every retry fetches a *new* challenge — reusing the one that was just rejected only wastes requests.
-- Retries use exponential backoff with jitter (`X_MAX_ATTEMPTS`, default 3) and honour upstream `429` `Retry-After` values. Failures are surfaced with the upstream payload instead of a generic apology.
+- Retries use exponential backoff with jitter (`X_MAX_ATTEMPTS`, default 3, the same budget for streaming and non-streaming requests), wait extra after a `418`, and honour upstream `429` `Retry-After` values up to 30s. Failures are surfaced with the upstream payload instead of a generic apology; a failure in the middle of a stream arrives as an OpenAI-style `error` event followed by `[DONE]`.
 - An empty completion is retried as well; only after all attempts fail does the server return an apology message.
 
 On top of that the server applies its own rate limiting: at most `X_MAX_REQUESTS_PER_MINUTE` (20) requests per minute and at least `X_MIN_REQUEST_INTERVAL_MS` (1s) between two requests. The check and the bookkeeping happen under a lock, so concurrent requests cannot overrun the budget.
