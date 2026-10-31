@@ -634,14 +634,16 @@ bun run dev
 ### Tests
 
 ```bash
-bun test              # all tests
-bun run test:openai   # simple OpenAI SDK test
-bun run test:tools    # tool calling tests
-bun run test:e2e      # end-to-end tool calling test
-bun run typecheck     # tsc --noEmit
+bun test                          # unit tests only (mocked, no network)
+DUCKAI_LIVE=1 bun test            # + end-to-end suites
+bun run test:tools                # tool calling unit tests
+bun run typecheck                 # tsc --noEmit
 ```
 
-The test suite talks to the live duck.ai backend, so it depends on your `.env` values and on DuckDuckGo being reachable.
+The end-to-end suites (`server`, `openai-library`, `openai-simple`,
+`e2e-tools`) spawn the real server and talk to the live duck.ai backend, so they
+depend on your `.env` values and on DuckDuckGo being reachable — which is also
+why they are opt-in behind `DUCKAI_LIVE=1` and skipped by default.
 
 ### Diagnostics
 
