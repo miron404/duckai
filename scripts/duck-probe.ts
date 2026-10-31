@@ -10,6 +10,9 @@
  *   bun run scripts/duck-probe.ts                     # 3 requests, raw mode
  *   bun run scripts/duck-probe.ts --count=10          # more samples
  *   bun run scripts/duck-probe.ts --mode=chat         # full OpenAIService path
+ *   bun run scripts/duck-probe.ts --mode=chain        # like raw, but chain the
+ *                                                     # challenge like a browser
+ *   bun run scripts/duck-probe.ts --interval=30000    # pause between requests
  *   bun run scripts/duck-probe.ts --jsa=<base64>      # replay a browser-captured
  *                                                     # x-vqd-hash-1 value
  *   bun run scripts/duck-probe.ts --dump              # full error payload, with
@@ -25,6 +28,13 @@
  * streaming); `--mode=chat` exercises retries, penalty handling and JSON
  * aggregation on top.
  *
+ * `--mode=chain` is `raw` with the browser's challenge flow: the web client
+ * calls `/status` once per page load and then solves the challenge that each
+ * `/chat` response returns in its `x-vqd-hash-1` header for the *next*
+ * message, while the server fetches a cold one from `/status` every time.
+ * Comparing `--mode=raw` against `--mode=chain` with the same `--count` and
+ * `--interval` measures whether that difference matters for the 418 rate.
+ *
  * Environment: everything from src/config.ts (X_USER_AGENT, STREAM_KEY, ...).
  */
 import { DuckAI } from "../src/duckai";
@@ -36,9 +46,10 @@ interface Options {
   count: number;
   model: string;
   prompt: string;
-  mode: "raw" | "chat";
+  mode: "raw" | "chat" | "chain";
   jsa?: string;
   dump: boolean;
+  intervalMs: number;
 }
 
 function parseArgs(argv: string[]): Options {
@@ -48,6 +59,7 @@ function parseArgs(argv: string[]): Options {
     prompt: "Reply with the single word: pong",
     mode: "raw",
     dump: false,
+    intervalMs: 1_000,
   };
 
   for (const arg of argv) {
@@ -64,10 +76,13 @@ function parseArgs(argv: string[]): Options {
         options.prompt = value;
         break;
       case "--mode":
-        if (value !== "raw" && value !== "chat") {
-          throw new Error("--mode must be 'raw' or 'chat'");
+        if (value !== "raw" && value !== "chat" && value !== "chain") {
+          throw new Error("--mode must be 'raw', 'chat' or 'chain'");
         }
         options.mode = value;
+        break;
+      case "--interval":
+        options.intervalMs = Math.max(0, Number.parseInt(value, 10) || 0);
         break;
       case "--jsa":
         options.jsa = value;
@@ -163,6 +178,8 @@ async function main() {
     DuckAI.transformToDuckAIRequest(request);
 
   const statuses: string[] = [];
+  // --mode=chain: the challenge the previous /chat response handed out.
+  let chainedChallenge: string | null = null;
 
   for (let index = 0; index < options.count; index++) {
     const startedAt = Date.now();
@@ -182,14 +199,26 @@ async function main() {
       }
     } else {
       try {
-        const vqd = options.jsa
-          ? { hash: options.jsa }
-          : await duck.getVQD();
+        let source = "status";
+        let vqd;
+        if (options.jsa) {
+          source = "jsa";
+          vqd = { hash: options.jsa };
+        } else if (options.mode === "chain" && chainedChallenge) {
+          source = "chain";
+          vqd = await duck.solveChallenge(chainedChallenge);
+        } else {
+          vqd = await duck.getVQD();
+        }
         const response = await duck.sendChatRequest(
           upstreamRequest,
           environment.userAgent,
           vqd,
         );
+        // The web client reads the header before checking the status, so a
+        // rejected request still hands out the next challenge.
+        const next = response.headers.get("x-vqd-hash-1");
+        if (options.mode === "chain") chainedChallenge = next;
         const body = await response.text();
         statuses.push(String(response.status));
         const detail =
@@ -197,7 +226,7 @@ async function main() {
             ? `${body.length} bytes`
             : body.trim().slice(0, 200).replace(/\s+/g, " ");
         console.log(
-          `[${index}] ${response.status} ${Date.now() - startedAt}ms ${detail}`,
+          `[${index}] ${response.status} ${Date.now() - startedAt}ms via ${source}, next challenge: ${next ? "yes" : "no"} ${detail}`,
         );
         if (options.dump && response.status !== 200) {
           for (const line of describeErrorPayload(body)) console.log(line);
@@ -210,7 +239,7 @@ async function main() {
       }
     }
 
-    if (index + 1 < options.count) await sleep(1_000);
+    if (index + 1 < options.count) await sleep(options.intervalMs);
   }
 
   console.log(`\nsummary: ${summarize(statuses)}`);

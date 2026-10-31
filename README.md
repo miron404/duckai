@@ -655,6 +655,9 @@ codes, which is the only reliable way to compare fingerprints or measure the
 bun run probe                   # 3 raw requests
 bun run probe --count=10        # more samples
 bun run probe --mode=chat       # full server path (retries included)
+bun run probe --mode=chain      # take each challenge from the previous
+                                # /chat response, like the browser does
+bun run probe --interval=30000  # longer pause between requests
 bun run probe --jsa=<base64>    # replay an x-vqd-hash-1 value captured in
                                 # DevTools, to test whether it is accepted at all
 ```

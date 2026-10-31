@@ -588,6 +588,20 @@ export class DuckAI {
   }
 
   /**
+   * Solves a challenge that arrived some other way than `/status` -- the web
+   * client takes the one for every message after the first from the
+   * `x-vqd-hash-1` header of the previous `/chat` response. Exposed for
+   * diagnostics (`probe --mode=chain`).
+   */
+  async solveChallenge(
+    vqdHash: string,
+    userAgent: string = config.userAgent,
+  ): Promise<VQDResponse> {
+    const frontend = await this.getFrontendInfo();
+    return this.encodeVqdHash(vqdHash, userAgent, frontend);
+  }
+
+  /**
    * Reads the JSON body of `/duckchat/v1/status`, which is
    * `{"status":"0","secondaryStatus":"0","statusV2":0,"grant":null}` for an
    * anonymous client. `grant` is the field to watch: if DuckDuckGo ever hands
