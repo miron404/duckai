@@ -41,6 +41,24 @@ export class UpstreamError extends AppError {
   }
 }
 
+/**
+ * duck.ai's usage allowance is spent (`ERR_USER_LIMIT` and friends). Unlike a
+ * rate limit this does not clear in seconds, so it is reported the way OpenAI
+ * reports an exhausted quota, with `Retry-After` pointing at the reset when
+ * duck.ai told us when that is.
+ */
+export class QuotaExceededError extends AppError {
+  readonly upstreamType: string;
+  readonly retryAfterMs: number | undefined;
+
+  constructor(message: string, upstreamType: string, retryAfterMs?: number) {
+    super(message, 429, "insufficient_quota");
+    this.name = "QuotaExceededError";
+    this.upstreamType = upstreamType;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
 export class RateLimitError extends AppError {
   readonly retryAfterMs: number;
 

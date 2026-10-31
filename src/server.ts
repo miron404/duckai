@@ -1,6 +1,12 @@
 import { OpenAIService } from "./openai-service";
 import { config } from "./config";
-import { AppError, RateLimitError, UnauthorizedError, ValidationError } from "./errors";
+import {
+  AppError,
+  QuotaExceededError,
+  RateLimitError,
+  UnauthorizedError,
+  ValidationError,
+} from "./errors";
 
 const openAIService = new OpenAIService();
 
@@ -31,8 +37,11 @@ function errorResponse(error: unknown): Response {
     "Content-Type": "application/json",
     ...corsHeaders,
   };
-  if (error instanceof RateLimitError) {
-    headers["Retry-After"] = String(Math.ceil(error.retryAfterMs / 1000));
+  if (
+    error instanceof RateLimitError ||
+    (error instanceof QuotaExceededError && error.retryAfterMs !== undefined)
+  ) {
+    headers["Retry-After"] = String(Math.ceil(error.retryAfterMs! / 1000));
   }
 
   return new Response(

@@ -5,7 +5,13 @@ import { SharedRateLimitMonitor } from "./shared-rate-limit-monitor";
 import { DUCKAI_MODELS } from "./models";
 import { config } from "./config";
 import { CookieJar } from "./cookie-jar";
-import { RateLimitError, UpstreamError, ValidationError } from "./errors";
+import {
+  AppError,
+  QuotaExceededError,
+  RateLimitError,
+  UpstreamError,
+  ValidationError,
+} from "./errors";
 import type {
   ChatCompletionMessage,
   VQDResponse,
@@ -72,11 +78,98 @@ interface FrontendInfo {
 interface UpstreamErrorPayload {
   status?: number;
   type?: string;
+  /** duck.ai's own verdict; `false` means retrying cannot help. */
+  retriable?: boolean;
+  windows: UsageWindow[];
   message: string;
 }
 
+/**
+ * One entry of `fixedCostWindowUsage.windows`, sent by `/status` and with
+ * limit errors. Ids seen in the web client: `six_hours`, `day`, `iso_week`,
+ * `month`.
+ */
+interface UsageWindow {
+  id: string;
+  percentUsed: number;
+  resetAt: string;
+  isBlocked: boolean;
+}
+
+/** `statusV2` is a bitmask of the modes that are currently *unavailable*. */
+const STATUS_V2_CHAT_UNAVAILABLE = 1;
+
+/** The usage allowance is spent; retrying before the reset cannot help. */
+const QUOTA_ERROR_TYPES = new Set([
+  "ERR_USER_LIMIT",
+  "ERR_ACCOUNT_LIMIT",
+  "ERR_SERVICE_LIMIT",
+]);
+
+/** The request itself is too large; the client has to shorten it. */
+const REQUEST_SIZE_ERROR_TYPES = new Set([
+  "ERR_CONVERSATION_LIMIT",
+  "ERR_INPUT_LIMIT",
+  "ERR_OUTPUT_LIMIT",
+  "ERR_SELECTION_INPUT_LIMIT",
+]);
+
+/** Warn once a window passes this share of its allowance. */
+const USAGE_WARNING_PERCENT = 80;
+
 function truncate(value: string, limit = 300): string {
   return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+/** Keeps the well-formed entries of `fixedCostWindowUsage.windows`. */
+function parseUsageWindows(raw: unknown): UsageWindow[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (entry): entry is UsageWindow =>
+      !!entry && typeof entry === "object" &&
+      typeof entry.id === "string" &&
+      typeof entry.percentUsed === "number" &&
+      typeof entry.resetAt === "string" &&
+      Number.isFinite(Date.parse(entry.resetAt)) &&
+      typeof entry.isBlocked === "boolean",
+  );
+}
+
+/**
+ * The window that decides whether chatting works, picked like the web client
+ * does: among blocked windows the one that resets last, otherwise the fullest.
+ */
+function limitingWindow(windows: UsageWindow[]): UsageWindow | undefined {
+  const blocked = windows.filter((window) => window.isBlocked);
+  if (blocked.length > 0) {
+    return blocked.reduce((latest, window) =>
+      Date.parse(window.resetAt) > Date.parse(latest.resetAt) ? window : latest,
+    );
+  }
+  if (windows.length === 0) return undefined;
+  return windows.reduce((fullest, window) =>
+    window.percentUsed > fullest.percentUsed ? window : fullest,
+  );
+}
+
+function describeWindow(window: UsageWindow): string {
+  return `${window.id} window at ${window.percentUsed}%, resets at ${window.resetAt}`;
+}
+
+function quotaError(type: string, windows: UsageWindow[]): QuotaExceededError {
+  const window = limitingWindow(windows);
+  const resetAt = window ? Date.parse(window.resetAt) : NaN;
+  const retryAfterMs = Number.isFinite(resetAt)
+    ? Math.max(0, resetAt - Date.now())
+    : undefined;
+  const what = type === "ERR_SERVICE_LIMIT"
+    ? "duck.ai is over its service-wide limit"
+    : "duck.ai usage limit reached";
+  return new QuotaExceededError(
+    `${what} (${type})${window ? `: ${describeWindow(window)}` : ""}`,
+    type,
+    retryAfterMs,
+  );
 }
 
 /** Parses the `{"action":"error",...}` body duck.ai sends on failures. */
@@ -92,11 +185,36 @@ function parseUpstreamErrorPayload(body: string): UpstreamErrorPayload | null {
   if (!parsed || parsed.action !== "error") return null;
   const status = typeof parsed.status === "number" ? parsed.status : undefined;
   const type = typeof parsed.type === "string" ? parsed.type : undefined;
+  const usage = parsed.fixedCostWindowUsage as { windows?: unknown } | undefined;
   return {
     status,
     type,
+    retriable: typeof parsed.retriable === "boolean" ? parsed.retriable : undefined,
+    windows: parseUsageWindows(usage?.windows),
     message: `duck.ai error${type ? ` ${type}` : ""}${status ? ` (${status})` : ""}: ${truncate(trimmed)}`,
   };
+}
+
+/**
+ * Turns a duck.ai error payload into the error the client should see. The
+ * `type` decides, not the HTTP status: an exhausted allowance and a plain
+ * rate limit can both arrive as `429`, but only one of them clears soon.
+ */
+function upstreamError(
+  payload: UpstreamErrorPayload,
+  fallbackStatus: number,
+): AppError {
+  if (payload.type && QUOTA_ERROR_TYPES.has(payload.type)) {
+    return quotaError(payload.type, payload.windows);
+  }
+  if (payload.type && REQUEST_SIZE_ERROR_TYPES.has(payload.type)) {
+    return new AppError(
+      `duck.ai rejected the request size (${payload.type}); shorten the conversation or the attachments`,
+      400,
+      "invalid_request_error",
+    );
+  }
+  return new UpstreamError(payload.message, payload.status ?? fallbackStatus);
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -567,14 +685,17 @@ export class DuckAI {
       signal: AbortSignal.timeout(config.requestTimeoutMs),
     });
     this.cookies.absorb(response.headers);
-    await this.inspectStatusBody(response);
+    const body = await response.text().catch(() => "");
 
     if (!response.ok) {
+      const payload = parseUpstreamErrorPayload(body);
+      if (payload) throw upstreamError(payload, response.status);
       throw new UpstreamError(
         `VQD status request failed: ${response.status} ${response.statusText}`,
         response.status,
       );
     }
+    this.checkStatusBody(body);
 
     const hashHeader = response.headers.get("x-vqd-hash-1");
     if (!hashHeader) {
@@ -602,37 +723,52 @@ export class DuckAI {
   }
 
   /**
-   * Reads the JSON body of `/duckchat/v1/status`, which is
+   * Reads the JSON body of a successful `/duckchat/v1/status`, which is
    * `{"status":"0","secondaryStatus":"0","statusV2":0,"grant":null}` for an
-   * anonymous client. `grant` is the field to watch: if DuckDuckGo ever hands
-   * out a signed grant instead of trusting the challenge alone, it arrives here
-   * and would have to be forwarded, so a non-null value is worth a warning.
-   * Never throws -- the body is diagnostics, the header carries the challenge.
+   * anonymous client with allowance left. It makes the same checks the web
+   * client makes before it lets the user type, so an exhausted allowance fails
+   * here instead of spending a `/chat` request:
+   *
+   * - `status: "2"` -- duck.ai as a whole is over its limit (`ERR_SERVICE_LIMIT`)
+   * - `statusV2` -- bitmask of *unavailable* modes (1 chat, 2 images, 4 voice);
+   *   the chat bit means this client's allowance is spent (`ERR_USER_LIMIT`)
+   * - `fixedCostWindowUsage.windows` -- per-window usage and reset time
+   *
+   * `grant` is still only watched: if DuckDuckGo ever hands out a signed grant
+   * instead of trusting the challenge alone, it would have to be forwarded.
+   * An unparseable body is ignored -- the header carries the challenge.
    */
-  private async inspectStatusBody(response: Response): Promise<void> {
+  private checkStatusBody(body: string): void {
+    let status: {
+      status?: unknown;
+      statusV2?: unknown;
+      fixedCostWindowUsage?: { windows?: unknown };
+      grant?: unknown;
+    };
     try {
-      const body = await response.text();
-      if (!body.trim()) return;
-
-      const status = JSON.parse(body) as {
-        status?: unknown;
-        secondaryStatus?: unknown;
-        statusV2?: unknown;
-        grant?: unknown;
-      };
-      if (status.grant) {
-        console.warn(
-          "duck.ai /status returned a grant; the client does not forward it yet",
-        );
-      }
-      const level = Number(status.statusV2 ?? status.status ?? 0);
-      if (Number.isFinite(level) && level !== 0) {
-        console.warn(
-          `duck.ai /status raised the challenge level (statusV2=${level})`,
-        );
-      }
+      status = JSON.parse(body);
     } catch {
-      // Not JSON or an unreadable body: not a reason to fail the request.
+      return;
+    }
+    if (!status || typeof status !== "object") return;
+
+    const windows = parseUsageWindows(status.fixedCostWindowUsage?.windows);
+    if (status.status === "2") throw quotaError("ERR_SERVICE_LIMIT", windows);
+    if (
+      typeof status.statusV2 === "number" &&
+      (status.statusV2 & STATUS_V2_CHAT_UNAVAILABLE) !== 0
+    ) {
+      throw quotaError("ERR_USER_LIMIT", windows);
+    }
+
+    if (status.grant) {
+      console.warn(
+        "duck.ai /status returned a grant; the client does not forward it yet",
+      );
+    }
+    const fullest = limitingWindow(windows);
+    if (fullest && fullest.percentUsed >= USAGE_WARNING_PERCENT) {
+      console.warn(`duck.ai usage: ${describeWindow(fullest)}`);
     }
   }
 
@@ -744,11 +880,20 @@ export class DuckAI {
 
       const body = await response.text().catch(() => "");
       const payload = parseUpstreamErrorPayload(body);
-      lastError = new UpstreamError(
-        payload?.message ??
+      if (payload) {
+        const error = upstreamError(payload, response.status);
+        // Quota and request-size errors are final, and so is anything
+        // duck.ai itself marks as not worth retrying.
+        if (!(error instanceof UpstreamError) || payload.retriable === false) {
+          throw error;
+        }
+        lastError = error;
+      } else {
+        lastError = new UpstreamError(
           `duck.ai returned ${response.status} ${response.statusText}: ${truncate(body)}`,
-        payload?.status ?? response.status,
-      );
+          response.status,
+        );
+      }
 
       if (response.status === 418) {
         // 418 is intermittent (see "Reliability" in README.md), not a sign of
@@ -784,9 +929,7 @@ export class DuckAI {
   /** Parses the SSE-ish body of a non-streaming completion. */
   private parseChatResponse(text: string): DuckAIChatResult {
     const payloadError = parseUpstreamErrorPayload(text);
-    if (payloadError) {
-      throw new UpstreamError(payloadError.message, payloadError.status ?? 502);
-    }
+    if (payloadError) throw upstreamError(payloadError, 502);
 
     let content = "";
     let reasoning = "";
@@ -806,10 +949,9 @@ export class DuckAI {
       if (!json || typeof json !== "object") continue;
 
       if (json.action === "error") {
-        throw new UpstreamError(
-          `duck.ai error: ${truncate(payload)}`,
-          typeof json.status === "number" ? json.status : 502,
-        );
+        // Same shape as a failed response body, so the same mapping applies
+        // (a quota error can arrive here after the 200).
+        throw upstreamError(parseUpstreamErrorPayload(payload)!, 502);
       }
       if (json.role === "reasoning" && typeof json.text === "string") {
         reasoning += json.text;
@@ -844,10 +986,12 @@ export class DuckAI {
       try {
         result = this.parseChatResponse(await response.text());
       } catch (error) {
+        // Body read failures (plain Errors) are worth another round trip;
+        // quota and request-size errors are not.
         const retryable =
           error instanceof UpstreamError
             ? isRetryableStatus(error.upstreamStatus)
-            : true;
+            : !(error instanceof AppError);
         if (!retryable || attempt === attempts - 1) throw error;
         console.warn(
           `duck.ai response failed (attempt ${attempt + 1}/${attempts}): ${(error as Error).message}`,
@@ -898,10 +1042,9 @@ export class DuckAI {
       if (!json || typeof json !== "object") return false;
 
       if (json.action === "error") {
-        throw new UpstreamError(
-          `duck.ai error: ${truncate(payload)}`,
-          typeof json.status === "number" ? json.status : 502,
-        );
+        // Same shape as a failed response body, so the same mapping applies
+        // (a quota error can arrive here after the 200).
+        throw upstreamError(parseUpstreamErrorPayload(payload)!, 502);
       }
       if (
         emitReasoning && json.role === "reasoning" &&
