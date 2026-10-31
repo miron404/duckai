@@ -178,6 +178,11 @@ export interface DuckAIRequest {
   metadata?: DuckAIMetadata;
   reasoningEffort?: DuckAIReasoningEffort;
   canUseTools: boolean;
+  /** null unless the user granted the "user location" consent. */
+  canUseApproxLocation?: boolean | null;
+  /** null unless image generation is delegated to the model. */
+  canDelegateImageGeneration?: boolean | null;
+  canShowGreeting?: boolean;
   durableStream?: DuckAIDurableStream;
 }
 

@@ -42,12 +42,16 @@ const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * duck.ai expects the same client fingerprint on every request, so one journey
- * id per process is enough (the real client keeps it per browser session).
+ * 32 hex characters, the shape of `x-ddg-journey-id`. Measured against the real
+ * client: the value differs on *every* request (`/status`, `/auth/token` and
+ * `/chat` each carry a different one), so it is generated per request instead
+ * of being pinned per process.
  */
-const JOURNEY_ID = Array.from({ length: 32 }, () =>
-  "0123456789abcdef"[Math.floor(Math.random() * 16)],
-).join("");
+function randomHexId(): string {
+  return Array.from({ length: 32 }, () =>
+    "0123456789abcdef"[Math.floor(Math.random() * 16)],
+  ).join("");
+}
 
 // Rate limiting tracking with sliding window
 interface RateLimitInfo {
@@ -386,12 +390,55 @@ export class DuckAI {
           "duck.ai frontend version could not be detected; falling back to configured values",
         );
       }
+      // The frontend hits these two before it can send anything; they are also
+      // where a browser picks up its experiment cookies, so treat them as part
+      // of the "page visit" that a chat request follows.
+      await this.warmUp();
       return info;
     } catch (error) {
       console.warn(
         `Failed to discover the duck.ai frontend version: ${(error as Error).message}`,
       );
       return fallback();
+    }
+  }
+
+  /**
+   * `GET /duckchat/v1/capabilities` and `GET /duckchat/v1/auth/token` are the
+   * two calls the frontend makes before it can chat. They are cheap and set the
+   * anonymous session cookie, so failures are ignored: they are parity, not a
+   * requirement for the chat request.
+   */
+  private async warmUp(): Promise<void> {
+    const request = (path: string) =>
+      fetch(`${DUCKAI_ORIGIN}${path}`, {
+        headers: {
+          ...this.cookieHeaders(),
+          accept: "*/*",
+          "accept-language": config.acceptLanguage,
+          "sec-fetch-dest": "empty",
+          "sec-fetch-mode": "cors",
+          "sec-fetch-site": "same-origin",
+          "sec-gpc": "1",
+          "te": "trailers",
+          "user-agent": config.userAgent,
+          "x-ddg-journey-id": randomHexId(),
+          referer: `${DUCKAI_ORIGIN}/`,
+        },
+        signal: AbortSignal.timeout(config.requestTimeoutMs),
+      });
+
+    for (const path of [
+      "/duckchat/v1/capabilities",
+      "/duckchat/v1/auth/token",
+    ]) {
+      try {
+        const response = await request(path);
+        this.cookies.absorb(response.headers);
+        await response.arrayBuffer().catch(() => undefined);
+      } catch {
+        // Best effort: a warm-up failure must not break discovery.
+      }
     }
   }
 
@@ -410,9 +457,23 @@ export class DuckAI {
     return `Error\n    at ${url}:2:1308110`;
   }
 
-  /** `x-fe-signals` payload: base64 of the fraud-signal envelope. */
+  /**
+   * `x-fe-signals` payload: base64 of the fraud-signal envelope. The web client
+   * records a `start`, the UI events of the session and an `end` offset; the
+   * measured values are `{start: <epoch ms>, events: [{name, delta, ...}],
+   * end: <ms since start>}`. Reporting an empty event list is accepted, but a
+   * single trusted `action` (the send click) is what a real session looks like.
+   */
   private feSignals(): string {
-    return btoa(JSON.stringify({ start: Date.now(), events: [], end: 0 }));
+    const start = Date.now();
+    const delta = 40 + Math.floor(Math.random() * 200);
+    return btoa(
+      JSON.stringify({
+        start,
+        events: [{ name: "action", delta, trusted: true }],
+        end: delta + 15 + Math.floor(Math.random() * 60),
+      }),
+    );
   }
 
   // --------------------------------------------------------------------- VQD
@@ -426,7 +487,6 @@ export class DuckAI {
     userAgent: string,
     frontend: FrontendInfo,
   ): Promise<VQDResponse> {
-    const startedAt = Date.now();
     const script = atob(vqdHash);
 
     const dom = new JSDOM(CHALLENGE_DOCUMENT, {
@@ -440,6 +500,9 @@ export class DuckAI {
       scope.__DDG_BE_VERSION__ = frontend.version || "dev";
       scope.__DDG_FE_CHAT_HASH__ = frontend.sha || "hash";
 
+      // Browsers report the time spent *executing* the challenge (8-27 ms in
+      // measurements); JSDOM's document setup is not part of that number.
+      const startedAt = Date.now();
       const result = (await dom.window.eval(script)) as {
         client_hashes?: unknown;
         meta?: unknown;
@@ -467,7 +530,7 @@ export class DuckAI {
         result.meta && typeof result.meta === "object"
           ? (result.meta as Record<string, unknown>)
           : {};
-      const duration = Math.max(1, Math.min(250, Date.now() - startedAt));
+      const duration = Math.max(5, Math.min(40, Date.now() - startedAt));
       result.meta = {
         ...meta,
         origin: DUCKAI_ORIGIN,
@@ -500,7 +563,7 @@ export class DuckAI {
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "x-vqd-accept": "1",
-        "x-ddg-journey-id": JOURNEY_ID,
+        "x-ddg-journey-id": randomHexId(),
         "user-agent": userAgent,
         referer: `${DUCKAI_ORIGIN}/`,
       },
@@ -545,10 +608,15 @@ export class DuckAI {
       "sec-fetch-dest": "empty",
       "sec-fetch-mode": "cors",
       "sec-fetch-site": "same-origin",
+      "sec-gpc": "1",
+      "te": "trailers",
       origin: DUCKAI_ORIGIN,
       referer: `${DUCKAI_ORIGIN}/`,
       "user-agent": userAgent,
-      "x-ddg-journey-id": JOURNEY_ID,
+      "x-ddg-journey-id": randomHexId(),
+      "x-duckai-consent-purposes":
+        "user-location,image-generation,web-search",
+      "x-duckai-response-id": randomUUID(),
       "x-fe-signals": this.feSignals(),
       "x-vqd-hash-1": vqd.hash,
     };
@@ -968,6 +1036,11 @@ export class DuckAI {
       metadata: request.metadata,
       model,
       reasoningEffort: reasoning_effort,
+      // The console shows these three on every request; they are the consent
+      // switches of the UI, so mirror their values when nothing was granted.
+      canUseApproxLocation: null,
+      canDelegateImageGeneration: null,
+      canShowGreeting: false,
       ...(durableStream ? { durableStream } : {}),
     };
   }
