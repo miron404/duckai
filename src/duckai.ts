@@ -571,6 +571,7 @@ export class DuckAI {
       signal: AbortSignal.timeout(config.requestTimeoutMs),
     });
     this.cookies.absorb(response.headers);
+    await this.inspectStatusBody(response);
 
     if (!response.ok) {
       throw new UpstreamError(
@@ -588,6 +589,41 @@ export class DuckAI {
     }
 
     return this.encodeVqdHash(hashHeader, userAgent, frontend);
+  }
+
+  /**
+   * Reads the JSON body of `/duckchat/v1/status`, which is
+   * `{"status":"0","secondaryStatus":"0","statusV2":0,"grant":null}` for an
+   * anonymous client. `grant` is the field to watch: if DuckDuckGo ever hands
+   * out a signed grant instead of trusting the challenge alone, it arrives here
+   * and would have to be forwarded, so a non-null value is worth a warning.
+   * Never throws -- the body is diagnostics, the header carries the challenge.
+   */
+  private async inspectStatusBody(response: Response): Promise<void> {
+    try {
+      const body = await response.text();
+      if (!body.trim()) return;
+
+      const status = JSON.parse(body) as {
+        status?: unknown;
+        secondaryStatus?: unknown;
+        statusV2?: unknown;
+        grant?: unknown;
+      };
+      if (status.grant) {
+        console.warn(
+          "duck.ai /status returned a grant; the client does not forward it yet",
+        );
+      }
+      const level = Number(status.statusV2 ?? status.status ?? 0);
+      if (Number.isFinite(level) && level !== 0) {
+        console.warn(
+          `duck.ai /status raised the challenge level (statusV2=${level})`,
+        );
+      }
+    } catch {
+      // Not JSON or an unreadable body: not a reason to fail the request.
+    }
   }
 
   /** Sends one chat request. Public so diagnostics scripts can reuse it. */
